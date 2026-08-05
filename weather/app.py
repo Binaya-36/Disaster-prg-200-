@@ -1,6 +1,6 @@
 import streamlit as st
 from datetime import datetime
-from weatgher.weather_api import get_weather
+from weather_api import get_weather
 
 st.title("Weather Module - Smart Disaster Prediction System")
 
