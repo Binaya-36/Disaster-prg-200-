@@ -41,15 +41,22 @@ def create_tables():
     """)
 
     # Inventory table
+    # district_id NULL + shelter_id NULL  -> central/national stock
+    # district_id set + shelter_id NULL   -> district-level stock
+    # shelter_id set                      -> stock physically at that shelter
     cur.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
             item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            district_id INTEGER NOT NULL,
+            sku TEXT UNIQUE,
+            district_id INTEGER,
+            shelter_id INTEGER,
             item_name TEXT NOT NULL,
             quantity INTEGER DEFAULT 0,
             unit TEXT,
             low_stock_threshold INTEGER DEFAULT 10,
-            FOREIGN KEY (district_id) REFERENCES districts (district_id)
+            last_restocked TEXT,
+            FOREIGN KEY (district_id) REFERENCES districts (district_id),
+            FOREIGN KEY (shelter_id) REFERENCES shelters (shelter_id)
         )
     """)
 
