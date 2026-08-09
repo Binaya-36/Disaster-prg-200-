@@ -89,3 +89,4 @@ def seed_inventory(csv_path="relief_inventory.csv"):
 if __name__ == "__main__":
     seed_districts_from_csv("district_information.csv")
     seed_inventory_from_csv("relief_inventory.csv")
+    

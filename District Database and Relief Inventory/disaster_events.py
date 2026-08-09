@@ -30,3 +30,4 @@ def delete_event(event_id):
     cur.execute("DELETE FROM disaster_events WHERE event_id = ?", (event_id,))
     conn.commit()
     conn.close()
+    
