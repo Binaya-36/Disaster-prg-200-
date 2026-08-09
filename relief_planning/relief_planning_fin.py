@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import math
+from datetime import datetime
 
 #Configurations
 DISTRICT_CSV = "district_information.csv"
@@ -103,6 +104,78 @@ def build_used_supplies_report(event_row: pd.Series) -> pd.DataFrame:
         {"Item": "Medicine Kits", "Unit": "kits", "Quantity Used": estimated_medicine_used, "Source": "Estimated"},
     ]
     return pd.DataFrame(rows)
+
+
+#New: comprehensive relief report helpers
+def add_stock_consumption(report: pd.DataFrame) -> pd.DataFrame:
+    """Add a '% Stock Consumed' column (Needed / Available * 100) to the inventory report."""
+    report = report.copy()
+
+    def pct(row):
+        if row["Available"] == 0:
+            return float("inf") if row["Needed"] > 0 else 0.0
+        return round((row["Needed"] / row["Available"]) * 100, 1)
+
+    report["% Stock Consumed"] = report.apply(pct, axis=1)
+    return report
+
+
+def add_priority_flags(shortage_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rank shortage rows by how critical the gap is, based on the % of the need
+    that is NOT covered by current stock (Shortfall / Needed * 100).
+    """
+    shortage_df = shortage_df.copy()
+
+    def pct_short(row):
+        if row["Needed"] == 0:
+            return 0.0
+        return (row["Shortfall"] / row["Needed"]) * 100
+
+    def priority(pct):
+        if pct > 50:
+            return "🔴 Critical"
+        elif pct > 20:
+            return "🟠 Moderate"
+        else:
+            return "🟡 Minor"
+
+    shortage_df["% Short"] = shortage_df.apply(pct_short, axis=1).round(1)
+    shortage_df["Priority"] = shortage_df["% Short"].apply(priority)
+    return shortage_df.sort_values("% Short", ascending=False)
+
+
+def build_reallocation_report(
+    current_district: str,
+    district_df: pd.DataFrame,
+    inventory_df: pd.DataFrame,
+    affected_percent: int,
+) -> pd.DataFrame:
+    """
+    Compare the selected district's relief need against every other district's
+    need. Relief inventory in this system is tracked as ONE shared pool (not
+    per-district), so this ranks districts by estimated need so the shared
+    stock can be prioritized/reallocated toward the districts that need it most.
+    """
+    rows = []
+    for _, row in district_df.iterrows():
+        population = int(row["Population"])
+        people_affected = round(population * affected_percent / 100)
+        aid = calculate_aid_needed(people_affected)
+        rows.append({
+            "District": row["District"],
+            "Population": population,
+            "People Affected": people_affected,
+            "Rice Needed (kg)": round(aid["Food (rice kg equivalent)"], 1),
+            "Water Needed (L)": aid["Water (litres)"],
+            "Medicine Kits Needed": aid["Medicine (kits)"],
+        })
+
+    realloc_df = pd.DataFrame(rows).sort_values("People Affected", ascending=False)
+    realloc_df["Selected District"] = realloc_df["District"].apply(
+        lambda d: "⭐ Selected" if d == current_district else ""
+    )
+    return realloc_df
 
 
 #Streamlit UI
@@ -225,6 +298,55 @@ def render_relief_planning_page():
             data=used_report.to_csv(index=False).encode("utf-8"),
             file_name=f"used_supplies_{selected_event['Event_ID']}.csv",
             mime="text/csv",
+        )
+
+    st.divider()
+
+    #  Comprehensive relief report (title/metadata, summary, % consumed,
+    #  priority flags, cross-district reallocation, chart, assumptions) 
+    st.subheader("7. Comprehensive Relief Report")
+
+    st.markdown(
+        f"**District:** {district_name} &nbsp;|&nbsp; "
+        f"**Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; "
+        f"**% Population Affected Used:** {affected_percent}%"
+    )
+
+    if shortage_df.empty:
+        st.success(f"**Summary:** {people_affected:,} people affected — ✅ SUFFICIENT (no shortages)")
+    else:
+        st.error(f"**Summary:** {people_affected:,} people affected — ⚠️ SHORTAGE in {len(shortage_df)} item(s)")
+
+    st.markdown("**Needed vs Available vs Shortfall (with % Stock Consumed)**")
+    report_with_consumption = add_stock_consumption(report)
+    st.dataframe(report_with_consumption, use_container_width=True, hide_index=True)
+
+    if not shortage_df.empty:
+        st.markdown("**Shortage Priority**")
+        priority_df = add_priority_flags(shortage_df)
+        st.dataframe(priority_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**Recommended Reallocation Across Districts**")
+    st.caption(
+        "Relief inventory in this system is tracked as one shared pool rather than "
+        "per district, so this ranks all districts by estimated need so the shared "
+        "stock can be prioritized toward the districts that need it most."
+    )
+    reallocation_df = build_reallocation_report(district_name, district_df, inventory_df, affected_percent)
+    st.dataframe(reallocation_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**Needed vs Available (Chart)**")
+    chart_data = report.set_index("Inventory Item")[["Needed", "Available"]]
+    st.bar_chart(chart_data)
+
+    with st.expander("Assumptions used in this report"):
+        st.markdown(
+            f"""
+            - Food = {MEALS_PER_PERSON} meal packs per person (≈ {KG_RICE_PER_MEAL_PACK} kg rice per meal pack)
+            - Water = {WATER_LITERS_PER_PERSON} litres per person
+            - Medicine = 1 kit per {PEOPLE_PER_MEDICINE_KIT} people (rounded up)
+            - Relief inventory is tracked as a single shared pool, not per-district
+            """
         )
 
 
