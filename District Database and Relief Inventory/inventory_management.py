@@ -1,16 +1,37 @@
 from database import get_connection
 from datetime import date
+import math
 
 
 # The 5 core relief items every shelter is automatically stocked with,
-# and how much each shelter should try to draw from central stock.
+# expressed as a per-person ratio so the amount scales with each shelter's
+# capacity instead of every shelter getting the same flat amount regardless
+# of size. Figures are rough humanitarian-relief rules of thumb (e.g. water
+# need per person per day) and can be tuned later.
 ESSENTIAL_ITEMS = [
-    {"item_name": "Rice",          "unit": "kg",     "target_qty": 500,  "low_stock_threshold": 100},
-    {"item_name": "Water",         "unit": "liters", "target_qty": 1000, "low_stock_threshold": 200},
-    {"item_name": "Medicine Kits", "unit": "kits",   "target_qty": 50,   "low_stock_threshold": 10},
-    {"item_name": "Blankets",      "unit": "pieces", "target_qty": 100,  "low_stock_threshold": 20},
-    {"item_name": "Tents",         "unit": "units",  "target_qty": 20,   "low_stock_threshold": 5},
+    {"item_name": "Rice",          "unit": "kg",     "per_person": 1.5,  "low_stock_pct": 0.2},
+    {"item_name": "Water",         "unit": "liters", "per_person": 15,   "low_stock_pct": 0.2},
+    {"item_name": "Medicine Kits", "unit": "kits",   "per_person": 0.1,  "low_stock_pct": 0.2},  # ~1 kit per 10 people
+    {"item_name": "Blankets",      "unit": "pieces", "per_person": 1,    "low_stock_pct": 0.2},
+    {"item_name": "Tents",         "unit": "units",  "per_person": 0.2,  "low_stock_pct": 0.2},   # ~1 tent per 5 people
 ]
+
+
+def _essential_item_quantities(capacity):
+    """Turns the per-person ratios above into concrete (target_qty, low_stock_threshold)
+    numbers for one shelter, given that shelter's capacity. Always at least 1 unit
+    of each item so a tiny shelter still gets something to work with."""
+    resolved = []
+    for item in ESSENTIAL_ITEMS:
+        target_qty = max(1, math.ceil(item["per_person"] * capacity))
+        threshold = max(1, round(target_qty * item["low_stock_pct"]))
+        resolved.append({
+            "item_name": item["item_name"],
+            "unit": item["unit"],
+            "target_qty": target_qty,
+            "low_stock_threshold": threshold,
+        })
+    return resolved
 
 
 def add_item(item_name, quantity, unit, low_stock_threshold=10,
@@ -25,10 +46,18 @@ def add_item(item_name, quantity, unit, low_stock_threshold=10,
     conn.close()
 
 
-def allocate_from_central_to_shelter(item_name, shelter_id, district_id, quantity, low_stock_threshold=10):
+def allocate_from_central_to_shelter(item_name, shelter_id, district_id, quantity,
+                                      low_stock_threshold=10, allow_reserve_dip=True):
     """
     Moves stock from central/national inventory directly to a shelter.
     Deducts from central stock; adds to (or tops up) the shelter's item.
+
+    allow_reserve_dip=True by default here because this function is also used
+    for automatic essential-item seeding of a brand-new shelter, which should
+    still partially stock the shelter even if central is low. When called from
+    a manual "top up this shelter" action, pass allow_reserve_dip=False to get
+    the same minimum-reserve protection as district-level allocation.
+
     Returns (success: bool, message: str, actual_amount_given: int).
     """
     conn = get_connection()
@@ -36,7 +65,7 @@ def allocate_from_central_to_shelter(item_name, shelter_id, district_id, quantit
 
     # Find the matching central item (district_id AND shelter_id both NULL)
     cur.execute("""
-        SELECT item_id, quantity, unit FROM inventory
+        SELECT item_id, quantity, unit, low_stock_threshold FROM inventory
         WHERE item_name = ? AND district_id IS NULL AND shelter_id IS NULL
     """, (item_name,))
     central_row = cur.fetchone()
@@ -45,7 +74,7 @@ def allocate_from_central_to_shelter(item_name, shelter_id, district_id, quantit
         conn.close()
         return False, f"'{item_name}' not found in central inventory.", 0
 
-    central_item_id, central_qty, unit = central_row
+    central_item_id, central_qty, unit, central_threshold = central_row
 
     if central_qty <= 0:
         conn.close()
@@ -53,6 +82,16 @@ def allocate_from_central_to_shelter(item_name, shelter_id, district_id, quantit
 
     # Give only as much as central stock actually has (partial allocation if short)
     actual_amount = min(quantity, central_qty)
+
+    if not allow_reserve_dip:
+        headroom = max(central_qty - central_threshold, 0)
+        if headroom <= 0:
+            conn.close()
+            return False, (
+                f"Central {item_name} is already at or below its minimum reserve "
+                f"({central_threshold} {unit}). Check 'allow reserve dip' to override."
+            ), 0
+        actual_amount = min(actual_amount, headroom)
 
     # Deduct from central
     cur.execute("UPDATE inventory SET quantity = quantity - ? WHERE item_id = ?", (actual_amount, central_item_id))
@@ -85,14 +124,14 @@ def allocate_from_central_to_shelter(item_name, shelter_id, district_id, quantit
     return True, f"Allocated {actual_amount} {unit} of {item_name} to shelter.", actual_amount
 
 
-def seed_shelter_essentials(shelter_id, district_id=None):
+def seed_shelter_essentials(shelter_id, capacity, district_id=None):
     """
-    Stocks a brand-new shelter with the 5 core relief items,
-    pulling directly from (and deducting) central/national inventory.
-    Returns a list of messages describing what happened for each item.
+    Stocks a brand-new shelter with the 5 core relief items, sized to that
+    shelter's capacity, pulling directly from (and deducting) central/national
+    inventory. Returns a list of messages describing what happened for each item.
     """
     messages = []
-    for item in ESSENTIAL_ITEMS:
+    for item in _essential_item_quantities(capacity):
         success, message, amount = allocate_from_central_to_shelter(
             item_name=item["item_name"],
             shelter_id=shelter_id,
@@ -206,23 +245,32 @@ def get_low_stock_items():
     return rows
 
 
-def allocate_from_central(central_item_id, district_id, quantity):
+def allocate_from_central(central_item_id, district_id, quantity, allow_reserve_dip=False):
     """
     Moves stock from central/national inventory to a specific district.
     Deducts from central stock; adds to (or creates) the matching district-level item.
+
+    A minimum reserve equal to the item's low_stock_threshold is protected:
+    by default you cannot allocate an amount that would push central stock
+    below that reserve. Pass allow_reserve_dip=True to override in a genuine
+    emergency (e.g. Severe/High risk event already logged for the district).
+
     Returns (success: bool, message: str).
     """
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("SELECT item_name, unit, quantity FROM inventory WHERE item_id = ?", (central_item_id,))
+    cur.execute(
+        "SELECT item_name, unit, quantity, low_stock_threshold FROM inventory WHERE item_id = ?",
+        (central_item_id,)
+    )
     central_row = cur.fetchone()
 
     if not central_row:
         conn.close()
         return False, "Central item not found."
 
-    item_name, unit, central_qty = central_row
+    item_name, unit, central_qty, threshold = central_row
 
     if quantity <= 0:
         conn.close()
@@ -231,6 +279,15 @@ def allocate_from_central(central_item_id, district_id, quantity):
     if quantity > central_qty:
         conn.close()
         return False, f"Not enough central stock. Only {central_qty} {unit} of {item_name} available."
+
+    reserve_after = central_qty - quantity
+    if reserve_after < threshold and not allow_reserve_dip:
+        available_above_reserve = max(central_qty - threshold, 0)
+        conn.close()
+        return False, (
+            f"That would drop central {item_name} below its minimum reserve of {threshold} {unit}. "
+            f"Only {available_above_reserve} {unit} can be allocated without dipping into reserve."
+        )
 
     # Deduct from central stock
     cur.execute("UPDATE inventory SET quantity = quantity - ? WHERE item_id = ?", (quantity, central_item_id))
@@ -259,4 +316,4 @@ def allocate_from_central(central_item_id, district_id, quantity):
 
     conn.commit()
     conn.close()
-    return True, f"Allocated {quantity} {unit} of {item_name} to district."
+    return True, f"Allocated {quantity} {unit} of {item_name} to district. {reserve_after} {unit} remain in central reserve."

@@ -55,7 +55,16 @@ def delete_district(district_id):
 # ---------- Shelter functions ----------
 
 def add_shelter(district_id, name, capacity, current_occupancy=0):
-    """Returns the newly created shelter_id, so we can auto-stock it right after."""
+    """Returns the newly created shelter_id, so we can auto-stock it right after.
+
+    Raises ValueError if occupancy exceeds capacity so bad data can never
+    reach the database, even if a caller forgets to check in the UI layer.
+    """
+    if current_occupancy > capacity:
+        raise ValueError(
+            f"Occupancy ({current_occupancy}) cannot exceed capacity ({capacity})."
+        )
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -81,6 +90,11 @@ def get_shelters(district_id=None):
 
 
 def update_shelter(shelter_id, name, capacity, current_occupancy):
+    if current_occupancy > capacity:
+        raise ValueError(
+            f"Occupancy ({current_occupancy}) cannot exceed capacity ({capacity})."
+        )
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -101,4 +115,3 @@ def delete_shelter(shelter_id):
     cur.execute("DELETE FROM shelters WHERE shelter_id = ?", (shelter_id,))
     conn.commit()
     conn.close()
-    

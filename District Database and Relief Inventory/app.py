@@ -58,22 +58,47 @@ elif page == "Shelter Management":
         selected_name = st.selectbox("Select District", list(district_options.keys()))
         district_id = district_options[selected_name]
 
+        # Show the result of the last auto-stock action, if any, even after
+        # the page has rerun (st.info calls right before st.rerun() would
+        # otherwise disappear before anyone could read them).
+        if st.session_state.get("last_stock_messages"):
+            with st.container(border=True):
+                st.markdown(f"**Stock distributed to '{st.session_state['last_stock_shelter_name']}':**")
+                for msg in st.session_state["last_stock_messages"]:
+                    st.write(f"- {msg}")
+            if st.button("Dismiss"):
+                st.session_state["last_stock_messages"] = None
+                st.rerun()
+
         with st.expander("Add New Shelter"):
             shelter_name = st.text_input("Shelter Name")
             capacity = st.number_input("Capacity", min_value=0, step=10)
-            occupancy = st.number_input("Current Occupancy", min_value=0, step=10)
+            occupancy = st.number_input(
+                "Current Occupancy", min_value=0, step=10,
+                help="Cannot exceed capacity."
+            )
             auto_stock = st.checkbox(
                 "Auto-stock with 5 essential relief items (Rice, Water, Medicine, Blankets, Tents) — pulled from Central Inventory",
                 value=True
             )
             if st.button("Add Shelter"):
-                new_shelter_id = dm.add_shelter(district_id, shelter_name, capacity, occupancy)
-                st.success(f"Shelter '{shelter_name}' added.")
-                if auto_stock:
-                    stock_messages = im.seed_shelter_essentials(new_shelter_id, district_id=district_id)
-                    for msg in stock_messages:
-                        st.info(msg)
-                st.rerun()
+                if occupancy > capacity:
+                    st.error(
+                        f"Occupancy ({occupancy}) cannot exceed capacity ({capacity}). "
+                        f"Lower the occupancy or raise the capacity."
+                    )
+                elif not shelter_name:
+                    st.warning("Shelter name is required.")
+                else:
+                    new_shelter_id = dm.add_shelter(district_id, shelter_name, capacity, occupancy)
+                    st.success(f"Shelter '{shelter_name}' added.")
+                    if auto_stock:
+                        stock_messages = im.seed_shelter_essentials(new_shelter_id, capacity, district_id=district_id)
+                        # Stash in session_state so it survives the rerun below
+                        # and is visible above, instead of flashing on screen.
+                        st.session_state["last_stock_messages"] = stock_messages
+                        st.session_state["last_stock_shelter_name"] = shelter_name
+                    st.rerun()
 
         st.subheader(f"Shelters in {selected_name}")
         shelters = dm.get_shelters(district_id)
@@ -82,10 +107,78 @@ elif page == "Shelter Management":
             col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
             col1.write(s_name)
             col2.write(f"Capacity: {cap}")
-            col3.write(f"Occupancy: {occ}")
+            fill_pct = f" ({occ / cap:.0%} full)" if cap else ""
+            col3.write(f"Occupancy: {occ}{fill_pct}")
             if col4.button("Delete", key=f"del_shel_{shelter_id}"):
                 dm.delete_shelter(shelter_id)
                 st.rerun()
+
+            # This is the part that was missing entirely: showing what stock
+            # actually sits at this shelter after auto-stocking or manual
+            # allocation, instead of only being visible as a deduction from
+            # the district/central inventory numbers.
+            with st.expander(f"View stock at {s_name}"):
+                shelter_items = im.get_shelter_inventory(shelter_id)
+                if shelter_items:
+                    for item in shelter_items:
+                        item_id, sku, i_d_id, i_s_id, i_name, qty, unit, threshold, last_restocked = item
+                        ic1, ic2, ic3, ic4 = st.columns([2, 2, 2, 1])
+                        ic1.write(i_name)
+                        ic2.write(f"{qty:,} {unit}")
+                        ic3.write(f"Last restocked: {last_restocked}")
+                        if qty <= threshold:
+                            ic4.error("Low")
+                        else:
+                            ic4.success("OK")
+                else:
+                    st.info("No stock recorded at this shelter yet.")
+
+                # Manual top-up: previously the only way stock ever reached a
+                # shelter was the one-time auto-stock at creation. This lets you
+                # add more of any central item to an existing shelter any time
+                # (e.g. the auto-stocked amount of Medicine Kits turns out to be
+                # too little once you know more about the situation on the ground).
+                st.markdown("**Add stock to this shelter**")
+                central_items_for_shelter = im.get_central_inventory()
+                if not central_items_for_shelter:
+                    st.caption("No central inventory items available to allocate.")
+                else:
+                    shelter_item_lookup = {
+                        f"{it[4]} — {it[5]:,} {it[6]} available": it for it in central_items_for_shelter
+                    }
+                    shelter_item_choice = st.selectbox(
+                        "Item", list(shelter_item_lookup.keys()), key=f"shelter_item_select_{shelter_id}"
+                    )
+                    chosen = shelter_item_lookup[shelter_item_choice]
+                    _, _, _, _, chosen_name, chosen_qty, chosen_unit, chosen_threshold, _ = chosen
+                    headroom = max(chosen_qty - chosen_threshold, 0)
+                    st.caption(
+                        f"{chosen_qty:,} {chosen_unit} in central stock · minimum reserve: {chosen_threshold:,} {chosen_unit} · "
+                        f"safely allocatable: {headroom:,} {chosen_unit}"
+                    )
+                    shelter_add_qty = st.number_input(
+                        "Quantity to add", min_value=0, step=1, key=f"shelter_add_qty_{shelter_id}"
+                    )
+                    shelter_allow_dip = st.checkbox(
+                        "Allow dipping into central reserve", value=False, key=f"shelter_allow_dip_{shelter_id}"
+                    )
+                    if st.button("Add Stock", key=f"shelter_add_stock_btn_{shelter_id}"):
+                        if shelter_add_qty > 0:
+                            success, message, amount = im.allocate_from_central_to_shelter(
+                                item_name=chosen_name,
+                                shelter_id=shelter_id,
+                                district_id=district_id,
+                                quantity=shelter_add_qty,
+                                low_stock_threshold=chosen_threshold,
+                                allow_reserve_dip=shelter_allow_dip,
+                            )
+                            if success:
+                                st.success(message)
+                                st.rerun()
+                            else:
+                                st.error(message)
+                        else:
+                            st.warning("Enter a quantity greater than 0.")
 
 # ---------------- Inventory Management ----------------
 elif page == "Inventory Management":
@@ -157,11 +250,30 @@ elif page == "Inventory Management":
 
         item_lookup = {f"{it[4]} — {it[5]:,} {it[6]} available": it[0] for it in central_items}
         item_to_allocate = st.selectbox("Select Item from Central Stock", list(item_lookup.keys()), key="alloc_item_select")
+
+        # Show how much can be allocated before central stock dips below its
+        # own minimum reserve, so it's not possible to unknowingly dump the
+        # entire central supply into one district.
+        selected_central = next(it for it in central_items if it[0] == item_lookup[item_to_allocate])
+        _, _, _, _, sel_name, sel_qty, sel_unit, sel_threshold, _ = selected_central
+        headroom = max(sel_qty - sel_threshold, 0)
+        st.caption(
+            f"{sel_qty:,} {sel_unit} in central stock · minimum reserve: {sel_threshold:,} {sel_unit} · "
+            f"safely allocatable without touching reserve: {headroom:,} {sel_unit}"
+        )
+
         alloc_qty = st.number_input("Quantity to Allocate", min_value=0, step=10, key="alloc_qty")
+        allow_reserve_dip = st.checkbox(
+            "Allow dipping into central reserve (only for a genuine emergency allocation)",
+            value=False, key="alloc_allow_reserve_dip"
+        )
 
         if st.button("Allocate to District"):
             if alloc_qty > 0:
-                success, message = im.allocate_from_central(item_lookup[item_to_allocate], district_id, alloc_qty)
+                success, message = im.allocate_from_central(
+                    item_lookup[item_to_allocate], district_id, alloc_qty,
+                    allow_reserve_dip=allow_reserve_dip
+                )
                 if success:
                     st.success(message)
                     st.rerun()
