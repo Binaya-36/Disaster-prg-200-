@@ -115,3 +115,4 @@ def delete_shelter(shelter_id):
     cur.execute("DELETE FROM shelters WHERE shelter_id = ?", (shelter_id,))
     conn.commit()
     conn.close()
+    
