@@ -361,3 +361,4 @@ elif page == "Disaster Events":
             if col5.button("Delete", key=f"del_event_{event_id}"):
                 de.delete_event(event_id)
                 st.rerun()
+                
