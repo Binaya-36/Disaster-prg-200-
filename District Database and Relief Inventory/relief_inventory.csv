@@ -1,0 +1,8 @@
+Item_ID,Item,Unit,Current_Quantity,Minimum_Stock,Last_Restocked
+ITM001,Rice,kg,30000,5000,2026-07-01
+ITM002,Water,liters,50000,10000,2026-07-01
+ITM003,Medicine Kits,kits,5000,1000,2026-07-15
+ITM004,Blankets,pieces,7000,1500,2026-06-20
+ITM005,Tents,units,1000,200,2026-06-20
+ITM006,First Aid Kits,kits,3000,600,2026-07-15
+
