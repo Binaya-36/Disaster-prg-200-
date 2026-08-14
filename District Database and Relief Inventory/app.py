@@ -18,14 +18,14 @@ for sibling_folder in ("Risk Engine", "weather"):
         if os.path.isdir(sibling_path) and sibling_path not in sys.path:
             sys.path.insert(0, sibling_path)
             break
-            
+
 from dotenv import load_dotenv
 for candidate_dir in (APP_DIR, REPO_ROOT, os.path.join(APP_DIR, "weather")):
     candidate_env = os.path.join(candidate_dir, ".env")
     if os.path.isfile(candidate_env):
         load_dotenv(candidate_env, override=False)
 
-# Imports
+# Imports all code
 from database import get_connection, create_tables
 from district_management import (
     get_districts, add_district, update_district, delete_district,
@@ -37,8 +37,7 @@ from inventory_management import (
     seed_shelter_essentials, get_shelter_inventory,
 )
 from disaster_events import get_events, add_event, delete_event
-import seed_data  # imported as a module
-
+import seed_data  # imported as a module 
 try:
     import risk_engine as risk
     RISK_ENGINE_AVAILABLE = True
@@ -56,7 +55,6 @@ except ImportError as e:
     WEATHER_IMPORT_ERROR = str(e)
 
 # Setup
-
 st.set_page_config(
     page_title="Smart Disaster Prediction & Relief Management System",
     page_icon="🚨",
@@ -84,9 +82,10 @@ def _districts_table_is_empty():
 
 
 def try_auto_seed():
-   
+
     if not _districts_table_is_empty():
         return
+
     try:
         with st.spinner("Seeding database from CSV files..."):
             n_districts = seed_data.seed_districts(DISTRICT_CSV)
@@ -105,7 +104,16 @@ try_auto_seed()
 
 
 def ensure_weather_api_key():
-
+    """
+    weather_api.py already reads WEATHER_API_KEY from .env correctly (that's
+    the right, secure approach -- never hardcode a key in source that's on a
+    public repo). This is only a *fallback* for when no .env is found: it
+    lets whoever is running the app (you, a teammate, your professor) paste a
+    key in for just this session. It's never written to disk and never
+    touches weather_api.py's source -- it just overrides the module-level
+    variable that file already exposes, the same way any Python code can.
+    Returns True if a usable key is available one way or another.
+    """
     if weather_api.API_KEY:
         return True
 
@@ -173,144 +181,214 @@ def page_home():
     c5.info("**📋 Disaster Events**\n\nSee every event the risk engine has logged, filterable by district.")
     st.caption("Use the sidebar to switch pages.")
 
+
 # Weather and risk
 def page_weather_risk():
     st.title("🌦️ Weather-Based Disaster Risk")
 
-    if not WEATHER_AVAILABLE or not RISK_ENGINE_AVAILABLE:
-        st.error("This page needs both weather_api.py/weather_db.py and risk_engine.py, "
-                  "and at least one of them failed to import. See the Home page for details.")
+    if not RISK_ENGINE_AVAILABLE:
+        st.error(f"risk_engine.py could not be imported ({RISK_ENGINE_IMPORT_ERROR}).")
+        return
+    if not WEATHER_AVAILABLE:
+        st.error(f"weather_api.py / weather_db.py could not be imported ({WEATHER_IMPORT_ERROR}).")
         return
 
-    st.caption("Fetches live weather, then runs it through the rule-based risk engine (flood / landslide / storm / heatwave).")
-
-    key_ready = ensure_weather_api_key()
+    st.caption("Fetches weather (live from the API, or entered manually), then runs it through "
+               "the rule-based risk engine (flood / landslide / storm / heatwave).")
 
     known_districts = risk.list_known_districts()
 
-    col_input, col_options = st.columns([2, 1])
-    with col_input:
-        city = st.selectbox(
-            "District / City",
-            options=known_districts,
-            index=known_districts.index("Kathmandu") if "Kathmandu" in known_districts else 0,
-            help="Pick a known district for an accurate terrain-based landslide check, "
-                 "or type a new one below if it's not listed.",
-        )
-        custom_city = st.text_input("...or type a different district/city name (overrides the dropdown)", "")
-        if custom_city.strip():
-            city = custom_city.strip()
-            
-        weather_query_override = st.text_input(
-            "Actual city/town name for weather lookup (only if the name above isn't found)",
-            "",
-            help="E.g. district 'Jhapa' → try 'Birtamod' or 'Chandragadhi' here. "
-                 "Leave blank to just query the name above directly.",
-        )
-        weather_query_name = weather_query_override.strip() or city
+    city = st.selectbox(
+        "District / City",
+        options=known_districts,
+        index=known_districts.index("Kathmandu") if "Kathmandu" in known_districts else 0,
+        help="Pick a known district for an accurate terrain-based landslide check, "
+             "or type a new one below if it's not listed.",
+    )
+    custom_city = st.text_input("...or type a different district/city name (overrides the dropdown)", "")
+    if custom_city.strip():
+        city = custom_city.strip()
 
-    with col_options:
-        use_manual_rainfall = st.checkbox(
-            "Enter 24h rainfall manually",
-            help="The weather API only gives a 1-hour rainfall reading, but the flood/landslide "
-                 "rules are calibrated for 24-hour totals. Check this to enter a real 24h figure.",
-        )
-        manual_rainfall = None
-        if use_manual_rainfall:
-            manual_rainfall = st.number_input("24-hour rainfall total (mm)", min_value=0.0, max_value=2000.0, value=0.0, step=1.0)
+    source = st.radio(
+        "Weather data source",
+        ["Live API lookup", "Enter weather manually"],
+        horizontal=True,
+        help="Manual entry runs the risk engine on values you type in directly -- no API key needed.",
+    )
 
-    fetch = st.button("Get Weather & Assess Risk", type="primary", disabled=not key_ready)
-    if not key_ready:
-        st.caption("Button disabled until an API key is entered above.")
+    weather_data = None
+    weather_query_name = city
+    manual_rainfall_24h = None
+    use_manual_rainfall_24h = False
 
-    if fetch:
-        with st.spinner(f"Fetching weather for {weather_query_name}..."):
-            api_result = get_weather(weather_query_name)
+    if source == "Live API lookup":
+        key_ready = ensure_weather_api_key()
 
-        if "error" in api_result:
-            st.error(api_result["error"])
-            st.caption(
-                "Note: this same message covers three different causes -- an unknown city/town "
-                f"name, an invalid API key, or a key that hasn't activated yet. If '{weather_query_name}' "
-                "isn't a real city/town, try the 'actual city/town name' field above (e.g. a "
-                "district's main town). If it IS a real place, double check the API key above is "
-                "correct and active (new OpenWeatherMap keys can take a little while to activate "
-                "after signup)."
+        col_input, col_options = st.columns([2, 1])
+        with col_input:
+            # Many Nepali district names (e.g. "Jhapa") aren't themselves recognized
+            # by the weather API -- it only knows actual city/town names, and a
+            # district's main town often has a different name. This lets the
+            # weather lookup use the right town while the risk engine still gets
+            # the correct terrain for the district selected above.
+            weather_query_override = st.text_input(
+                "Actual city/town name for weather lookup (only if the name above isn't found)",
+                "",
+                help="E.g. district 'Jhapa' → try 'Birtamod' or 'Chandragadhi' here. "
+                     "Leave blank to just query the name above directly.",
             )
-        else:
-            save_weather_reading(api_result)
+            weather_query_name = weather_query_override.strip() or city
 
-            icon_url = f"https://openweathermap.org/img/wn/{api_result['icon']}@2x.png"
+        with col_options:
+            use_manual_rainfall_24h = st.checkbox(
+                "Enter 24h rainfall manually",
+                help="The weather API only gives a 1-hour rainfall reading, but the flood/landslide "
+                     "rules are calibrated for 24-hour totals. Check this to enter a real 24h figure.",
+            )
+            if use_manual_rainfall_24h:
+                manual_rainfall_24h = st.number_input("24-hour rainfall total (mm)", min_value=0.0, max_value=2000.0, value=0.0, step=1.0)
+
+        fetch = st.button("Get Weather & Assess Risk", type="primary", disabled=not key_ready)
+        if not key_ready:
+            st.caption("Button disabled until an API key is entered above.")
+
+        if fetch:
+            with st.spinner(f"Fetching weather for {weather_query_name}..."):
+                api_result = get_weather(weather_query_name)
+
+            if "error" in api_result:
+                st.error(api_result["error"])
+                st.caption(
+                    "Note: this same message covers three different causes -- an unknown city/town "
+                    f"name, an invalid API key, or a key that hasn't activated yet. If '{weather_query_name}' "
+                    "isn't a real city/town, try the 'actual city/town name' field above (e.g. a "
+                    "district's main town). If it IS a real place, double check the API key above is "
+                    "correct and active (new OpenWeatherMap keys can take a little while to activate "
+                    "after signup). Or switch to 'Enter weather manually' above to test the risk "
+                    "engine without needing the API at all."
+                )
+            else:
+                weather_data = api_result
+
+    else:  # Enter weather manually
+        st.info("Type in conditions directly -- this skips the weather API entirely, so no key is needed.")
+
+        c1, c2, c3 = st.columns(3)
+        temperature = c1.number_input("Temperature (°C)", value=25.0, step=0.5)
+        humidity = c2.number_input("Humidity (%)", min_value=0, max_value=100, value=60, step=1)
+        wind_speed = c3.number_input("Wind Speed (m/s)", min_value=0.0, value=3.0, step=0.5)
+
+        c4, c5, c6 = st.columns(3)
+        rainfall_1h = c4.number_input("Rainfall - last 1 hour (mm)", min_value=0.0, value=0.0, step=1.0)
+        rainfall_24h = c5.number_input(
+            "Rainfall - last 24 hours (mm)", min_value=0.0, value=0.0, step=1.0,
+            help="This is the figure that actually drives the flood/landslide checks.",
+        )
+        pressure = c6.number_input("Pressure (hPa)", min_value=800, max_value=1100, value=1010, step=1)
+
+        description = st.text_input("Conditions description (optional, for your own notes)", "manually entered")
+
+        assess = st.button("Assess Risk", type="primary")
+        if assess:
+            weather_data = {
+                "city": city,
+                "temperature": temperature,
+                "feels_like": temperature,
+                "humidity": humidity,
+                "pressure": pressure,
+                "wind_speed": wind_speed,
+                "rainfall": rainfall_1h,
+                "description": description,
+                "icon": None,  # no real icon for manual entries
+            }
+            manual_rainfall_24h = rainfall_24h
+            use_manual_rainfall_24h = True
+            weather_query_name = city
+
+    if weather_data is not None:
+        save_weather_reading(weather_data)
+
+        if weather_data.get("icon"):
+            icon_url = f"https://openweathermap.org/img/wn/{weather_data['icon']}@2x.png"
             wcol1, wcol2 = st.columns([1, 3])
             with wcol1:
                 st.image(icon_url)
             with wcol2:
-                st.subheader(f"Weather in {api_result['city']}")
-                st.write(f"☁️ {api_result['description'].title()}")
+                st.subheader(f"Weather in {weather_data['city']}")
+                st.write(f"☁️ {weather_data['description'].title()}")
+        else:
+            st.subheader(f"Weather in {weather_data['city']} (manually entered)")
 
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
-            m1.metric("Temperature", f"{api_result['temperature']}°C")
-            m2.metric("Feels Like", f"{api_result['feels_like']}°C")
-            m3.metric("Humidity", f"{api_result['humidity']}%")
-            m4.metric("Wind Speed", f"{api_result['wind_speed']} m/s")
-            m5.metric("Rainfall (1h)", f"{api_result['rainfall']} mm")
-            m6.metric("Pressure", f"{api_result['pressure']} hPa")
-            st.caption(f"Last updated: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Temperature", f"{weather_data['temperature']}°C")
+        m2.metric("Feels Like", f"{weather_data['feels_like']}°C")
+        m3.metric("Humidity", f"{weather_data['humidity']}%")
+        m4.metric("Wind Speed", f"{weather_data['wind_speed']} m/s")
+        m5.metric("Rainfall (1h)", f"{weather_data['rainfall']} mm")
+        m6.metric("Pressure", f"{weather_data['pressure']} hPa")
+        st.caption(f"Last updated: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
 
-            st.divider()
-            st.subheader("🚨 Risk Assessment")
+        st.divider()
+        st.subheader("🚨 Risk Assessment")
 
-            district_terrain, _ = risk.get_terrain(city)
-            result = risk.predict_from_weather_api(
-                api_result,
-                wind_unit="m/s",
-                rainfall_mm_24h=manual_rainfall if use_manual_rainfall else None,
-                terrain=district_terrain,
-            )
+        # Terrain is looked up from the DISTRICT selected above (not from
+        # whatever town name the weather API happened to resolve to), and
+        # passed explicitly -- risk_engine.py supports this via its own
+        # terrain= parameter, so weather can come from a nearby town's (or a
+        # manually entered) reading while the risk assessment still reflects
+        # the right district.
+        district_terrain, _ = risk.get_terrain(city)
+        result = risk.predict_from_weather_api(
+            weather_data,
+            wind_unit="m/s",
+            rainfall_mm_24h=manual_rainfall_24h if use_manual_rainfall_24h else None,
+            terrain=district_terrain,
+        )
 
-            if "error" in result:
-                st.error(f"Risk engine could not assess this reading: {result['error']}")
+        if "error" in result:
+            st.error(f"Risk engine could not assess this reading: {result['error']}")
+        else:
+            level_color = {"Low": "🟢", "Moderate": "🟡", "High": "🟠", "Severe": "🔴"}
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Overall Risk Level", f"{level_color.get(result['risk_level'], '')} {result['risk_level']}")
+            r2.metric("Risk Score", f"{result['risk_score']} / 100")
+            r3.metric("Primary Hazard", result["disaster_type"])
+
+            for warning in result.get("warnings", []):
+                st.info(f"ℹ️ {warning}")
+
+            if result["all_hazards"]:
+                st.markdown("**Hazard breakdown**")
+                hazard_df = pd.DataFrame(result["all_hazards"])[["disaster_type", "risk_score", "risk_level", "reason"]]
+                hazard_df.columns = ["Hazard", "Score", "Level", "Reason"]
+                st.dataframe(hazard_df, use_container_width=True, hide_index=True)
             else:
-                level_color = {"Low": "🟢", "Moderate": "🟡", "High": "🟠", "Severe": "🔴"}
-                r1, r2, r3 = st.columns(3)
-                r1.metric("Overall Risk Level", f"{level_color.get(result['risk_level'], '')} {result['risk_level']}")
-                r2.metric("Risk Score", f"{result['risk_score']} / 100")
-                r3.metric("Primary Hazard", result["disaster_type"])
+                st.success("No hazard thresholds were exceeded by this reading.")
 
-                for warning in result.get("warnings", []):
-                    st.info(f"ℹ️ {warning}")
+            with st.expander("Recommended actions"):
+                for line in result["recommendations"]:
+                    st.markdown(f"- {line}")
 
-                if result["all_hazards"]:
-                    st.markdown("**Hazard breakdown**")
-                    hazard_df = pd.DataFrame(result["all_hazards"])[["disaster_type", "risk_score", "risk_level", "reason"]]
-                    hazard_df.columns = ["Hazard", "Score", "Level", "Reason"]
-                    st.dataframe(hazard_df, use_container_width=True, hide_index=True)
-                else:
-                    st.success("No hazard thresholds were exceeded by this reading.")
+            if result["event_triggered"]:
+                st.warning(f"🔔 This reading triggered a **{result['risk_level']}** event and has been logged.")
 
-                with st.expander("Recommended actions"):
-                    for line in result["recommendations"]:
-                        st.markdown(f"- {line}")
-
-                if result["event_triggered"]:
-                    st.warning(f"🔔 This reading triggered a **{result['risk_level']}** event and has been logged.")
-
+                existing = {d[1]: d[0] for d in get_districts()}
+                district_name = city
+                if district_name not in existing:
+                    add_district(district_name, province="Unknown", population=0, terrain=result["terrain"])
                     existing = {d[1]: d[0] for d in get_districts()}
-                    district_name = city
-                    if district_name not in existing:
-                        add_district(district_name, province="Unknown", population=0, terrain=result["terrain"])
-                        existing = {d[1]: d[0] for d in get_districts()}
 
-                    district_id = existing[district_name]
-                    add_event(
-                        district_id=district_id,
-                        disaster_type=result["disaster_type"],
-                        event_date=result["event"]["event_date"],
-                        risk_level=result["risk_level"],
-                        description=result["reason"],
-                    )
+                district_id = existing[district_name]
+                add_event(
+                    district_id=district_id,
+                    disaster_type=result["disaster_type"],
+                    event_date=result["event"]["event_date"],
+                    risk_level=result["risk_level"],
+                    description=result["reason"],
+                )
 
     st.divider()
+
     st.subheader(f"Recent Weather History for {weather_query_name}")
     history = get_weather_history(city=weather_query_name, limit=10)
     if history:
@@ -325,10 +403,10 @@ def page_weather_risk():
                           "Rainfall (mm)", "Wind Speed (m/s)", "Pressure (hPa)", "Description"]]
         st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
-        st.info("No history yet for this city. Click 'Get Weather & Assess Risk' to start logging.")
+        st.info("No history yet for this city. Fetch or assess weather above to start logging.")
 
 
-# Districts & Shelters
+# Districts and shelters
 def page_districts_shelters():
     st.title("🏘️ Districts & Shelters")
 
@@ -583,7 +661,7 @@ def page_inventory():
             st.success("Nothing is currently low on stock, anywhere in the system.")
 
 
-# Relief Planning
+# Relief planning
 MEALS_PER_PERSON = 2
 WATER_LITERS_PER_PERSON = 3
 PEOPLE_PER_MEDICINE_KIT = 25
@@ -812,7 +890,7 @@ def page_relief_planning():
                                 file_name=f"final_allocation_{district}.csv", mime="text/csv")
 
 
-# Disaster Events 
+# Disaster events
 def page_disaster_events():
     st.title("📋 Disaster Events Log")
     st.caption("Events logged automatically by the risk engine (High/Severe readings), plus any added manually below.")
