@@ -1,364 +1,878 @@
+import math
+import os
+import sys
+from datetime import datetime
+
+import pandas as pd
+import plotly.express as px
 import streamlit as st
-from database import create_tables
-import district_management as dm
-import inventory_management as im
-import disaster_events as de
-import seed_data
-import datetime
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(APP_DIR)
+
+CANDIDATE_PARENTS = [APP_DIR, REPO_ROOT]
+
+for sibling_folder in ("Risk Engine", "weather"):
+    for parent in CANDIDATE_PARENTS:
+        sibling_path = os.path.join(parent, sibling_folder)
+        if os.path.isdir(sibling_path) and sibling_path not in sys.path:
+            sys.path.insert(0, sibling_path)
+            break
+            
+from dotenv import load_dotenv
+for candidate_dir in (APP_DIR, REPO_ROOT, os.path.join(APP_DIR, "weather")):
+    candidate_env = os.path.join(candidate_dir, ".env")
+    if os.path.isfile(candidate_env):
+        load_dotenv(candidate_env, override=False)
+
+# Imports
+from database import get_connection, create_tables
+from district_management import (
+    get_districts, add_district, update_district, delete_district,
+    get_shelters, add_shelter, update_shelter, delete_shelter,
+)
+from inventory_management import (
+    get_central_inventory, add_central_item, restock_item, update_item, delete_item,
+    get_low_stock_items, allocate_from_central, allocate_from_central_to_shelter,
+    seed_shelter_essentials, get_shelter_inventory,
+)
+from disaster_events import get_events, add_event, delete_event
+import seed_data  # imported as a module
+
+try:
+    import risk_engine as risk
+    RISK_ENGINE_AVAILABLE = True
+except ImportError as e:
+    RISK_ENGINE_AVAILABLE = False
+    RISK_ENGINE_IMPORT_ERROR = str(e)
+
+try:
+    import weather_api  # module reference kept so we can set weather_api.API_KEY at runtime
+    from weather_api import get_weather
+    from weather_db import save_weather_reading, get_weather_history
+    WEATHER_AVAILABLE = True
+except ImportError as e:
+    WEATHER_AVAILABLE = False
+    WEATHER_IMPORT_ERROR = str(e)
+
+# Setup
+
+st.set_page_config(
+    page_title="Smart Disaster Prediction & Relief Management System",
+    page_icon="🚨",
+    layout="wide",
+)
 
 create_tables()
-seed_data.seed_districts()
-seed_data.seed_inventory()
 
-st.set_page_config(page_title="District & Inventory Management", layout="wide")
-st.title("District & Relief Inventory Management")
+DISTRICT_CSV = os.path.join(APP_DIR, "district_information.csv")
+INVENTORY_CSV = os.path.join(APP_DIR, "relief_inventory.csv")
 
-page = st.sidebar.radio("Go to", ["District Management", "Shelter Management", "Inventory Management", "Disaster Events"])
+DISTRICT_COLS = ["ID", "Name", "Province", "Population", "Terrain",
+                  "Shelter Count (CSV)", "Flood Prone", "Landslide Prone", "Vulnerability"]
+INV_COLS = ["Item ID", "SKU", "District ID", "Shelter ID", "Item", "Quantity", "Unit", "Low Stock Threshold", "Last Restocked"]
 
-# ---------------- District Management ----------------
-if page == "District Management":
-    st.header("District Management")
 
-    with st.expander("Add New District"):
-        name = st.text_input("District Name")
-        province = st.text_input("Province")
-        population = st.number_input("Population", min_value=0, step=1000)
-        terrain = st.selectbox("Terrain", ["Mountain", "Hill", "Terai", "Valley", "Plain"])
-        vulnerability = st.selectbox("Vulnerability Level", ["Low", "Moderate", "High", "Severe", "Unknown"])
-        if st.button("Add District"):
-            dm.add_district(name, province, population, terrain, vulnerability)
-            st.success(f"District '{name}' added.")
-            st.rerun()
+def _districts_table_is_empty():
+    """Just a COUNT(*) against the existing districts table -- doesn't touch database.py."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM districts")
+    count = cur.fetchone()[0]
+    conn.close()
+    return count == 0
 
-    st.subheader("Existing Districts")
-    districts = dm.get_districts()
-    for d in districts:
-        district_id, name, province, population, terrain, shelter_count, flood_prone, landslide_prone, vulnerability = d
-        col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([2, 1.5, 1.5, 1.2, 1, 1, 1, 1])
-        col1.write(name)
-        col2.write(province)
-        col3.write(f"{population:,}")
-        col4.write(terrain)
-        col5.write(vulnerability)
-        col6.write("🌊" if flood_prone == "Yes" else "—")
-        col7.write("⛰️" if landslide_prone == "Yes" else "—")
-        if col8.button("Delete", key=f"del_dist_{district_id}"):
-            dm.delete_district(district_id)
-            st.rerun()
 
-# ---------------- Shelter Management ----------------
-elif page == "Shelter Management":
-    st.header("Shelter Management")
+def try_auto_seed():
+   
+    if not _districts_table_is_empty():
+        return
+    try:
+        with st.spinner("Seeding database from CSV files..."):
+            n_districts = seed_data.seed_districts(DISTRICT_CSV)
+            n_items = seed_data.seed_inventory(INVENTORY_CSV)
+        st.toast(f"Seeded {n_districts} districts and {n_items} inventory items.", icon="✅")
+    except Exception as e:
+        st.info(
+            f"Auto-seeding from seed_data.py was skipped ({type(e).__name__}: {e}). "
+            "This means seed_data.py expects CSV columns the real CSV files don't have -- "
+            "that's a mismatch to flag with whoever owns seed_data.py. In the meantime you "
+            "can add districts, shelters, and inventory manually from their pages below."
+        )
 
-    districts = dm.get_districts()
-    if not districts:
-        st.warning("Add a district first.")
+
+try_auto_seed()
+
+
+def ensure_weather_api_key():
+
+    if weather_api.API_KEY:
+        return True
+
+    if "manual_weather_api_key" in st.session_state and st.session_state["manual_weather_api_key"]:
+        weather_api.API_KEY = st.session_state["manual_weather_api_key"]
+        return True
+
+    st.warning(
+        "No WEATHER_API_KEY found (no .env file, or it wasn't picked up). Any weather "
+        "lookup will fail with a misleading 'City not found' message until a key is set. "
+        "Preferred fix: create a `.env` file next to app.py containing "
+        "`WEATHER_API_KEY=your_key_here`. As a fallback for this session only, you can "
+        "paste a key below instead -- it is kept in memory only, never saved to disk."
+    )
+    manual_key = st.text_input("OpenWeatherMap API key (session only)", type="password", key="manual_weather_api_key_input")
+    if manual_key:
+        st.session_state["manual_weather_api_key"] = manual_key
+        weather_api.API_KEY = manual_key
+        st.rerun()
+    return False
+
+
+# Home
+def page_home():
+    st.title("🚨 Smart Disaster Prediction & Relief Management System")
+    st.caption(
+        "One dashboard combining weather-based risk prediction, district & shelter "
+        "records, relief inventory, and relief-requirement planning."
+    )
+    st.divider()
+
+    districts = get_districts()
+    shelters = get_shelters()
+    central_items = get_central_inventory()
+    low_stock = get_low_stock_items()
+    events = get_events()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Districts Tracked", len(districts))
+    col2.metric("Registered Shelters", len(shelters))
+    col3.metric("Central Inventory Items", len(central_items))
+    col4.metric("Active Disaster Events", len(events))
+
+    if low_stock:
+        st.warning(f"⚠️ {len(low_stock)} inventory item(s) are at or below their low-stock threshold. See the Inventory page.")
     else:
-        district_options = {d[1]: d[0] for d in districts}
-        selected_name = st.selectbox("Select District", list(district_options.keys()))
-        district_id = district_options[selected_name]
+        st.success("✅ No inventory items are currently low on stock.")
 
-        # Show the result of the last auto-stock action, if any, even after
-        # the page has rerun (st.info calls right before st.rerun() would
-        # otherwise disappear before anyone could read them).
-        if st.session_state.get("last_stock_messages"):
-            with st.container(border=True):
-                st.markdown(f"**Stock distributed to '{st.session_state['last_stock_shelter_name']}':**")
-                for msg in st.session_state["last_stock_messages"]:
-                    st.write(f"- {msg}")
-            if st.button("Dismiss"):
-                st.session_state["last_stock_messages"] = None
-                st.rerun()
+    if not RISK_ENGINE_AVAILABLE:
+        st.error(f"risk_engine.py could not be imported ({RISK_ENGINE_IMPORT_ERROR}). "
+                  "Check that the 'Risk Engine' folder is where app.py expects it.")
+    if not WEATHER_AVAILABLE:
+        st.error(f"weather_api.py / weather_db.py could not be imported ({WEATHER_IMPORT_ERROR}). "
+                  "Check that the 'weather' folder is where app.py expects it.")
+    elif not weather_api.API_KEY:
+        st.info("⚠️ No weather API key configured yet -- see the Weather & Risk page.")
 
-        with st.expander("Add New Shelter"):
-            shelter_name = st.text_input("Shelter Name")
-            capacity = st.number_input("Capacity", min_value=0, step=10)
-            occupancy = st.number_input(
-                "Current Occupancy", min_value=0, step=10,
-                help="Cannot exceed capacity."
+    st.divider()
+    st.subheader("Where to go")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.info("**🌦️ Weather & Risk**\n\nFetch live weather for a district and run it through the risk engine.")
+    c2.info("**🏘️ Districts & Shelters**\n\nManage district records and shelters, with auto-stocking of essentials.")
+    c3.info("**📦 Inventory**\n\nCentral stock, restocking, and allocation to districts or shelters.")
+    c4.info("**🧺 Relief Planning**\n\nCalculate relief requirements for an affected population and compare to stock.")
+    c5.info("**📋 Disaster Events**\n\nSee every event the risk engine has logged, filterable by district.")
+    st.caption("Use the sidebar to switch pages.")
+
+# Weather and risk
+def page_weather_risk():
+    st.title("🌦️ Weather-Based Disaster Risk")
+
+    if not WEATHER_AVAILABLE or not RISK_ENGINE_AVAILABLE:
+        st.error("This page needs both weather_api.py/weather_db.py and risk_engine.py, "
+                  "and at least one of them failed to import. See the Home page for details.")
+        return
+
+    st.caption("Fetches live weather, then runs it through the rule-based risk engine (flood / landslide / storm / heatwave).")
+
+    key_ready = ensure_weather_api_key()
+
+    known_districts = risk.list_known_districts()
+
+    col_input, col_options = st.columns([2, 1])
+    with col_input:
+        city = st.selectbox(
+            "District / City",
+            options=known_districts,
+            index=known_districts.index("Kathmandu") if "Kathmandu" in known_districts else 0,
+            help="Pick a known district for an accurate terrain-based landslide check, "
+                 "or type a new one below if it's not listed.",
+        )
+        custom_city = st.text_input("...or type a different district/city name (overrides the dropdown)", "")
+        if custom_city.strip():
+            city = custom_city.strip()
+            
+        weather_query_override = st.text_input(
+            "Actual city/town name for weather lookup (only if the name above isn't found)",
+            "",
+            help="E.g. district 'Jhapa' → try 'Birtamod' or 'Chandragadhi' here. "
+                 "Leave blank to just query the name above directly.",
+        )
+        weather_query_name = weather_query_override.strip() or city
+
+    with col_options:
+        use_manual_rainfall = st.checkbox(
+            "Enter 24h rainfall manually",
+            help="The weather API only gives a 1-hour rainfall reading, but the flood/landslide "
+                 "rules are calibrated for 24-hour totals. Check this to enter a real 24h figure.",
+        )
+        manual_rainfall = None
+        if use_manual_rainfall:
+            manual_rainfall = st.number_input("24-hour rainfall total (mm)", min_value=0.0, max_value=2000.0, value=0.0, step=1.0)
+
+    fetch = st.button("Get Weather & Assess Risk", type="primary", disabled=not key_ready)
+    if not key_ready:
+        st.caption("Button disabled until an API key is entered above.")
+
+    if fetch:
+        with st.spinner(f"Fetching weather for {weather_query_name}..."):
+            api_result = get_weather(weather_query_name)
+
+        if "error" in api_result:
+            st.error(api_result["error"])
+            st.caption(
+                "Note: this same message covers three different causes -- an unknown city/town "
+                f"name, an invalid API key, or a key that hasn't activated yet. If '{weather_query_name}' "
+                "isn't a real city/town, try the 'actual city/town name' field above (e.g. a "
+                "district's main town). If it IS a real place, double check the API key above is "
+                "correct and active (new OpenWeatherMap keys can take a little while to activate "
+                "after signup)."
             )
-            auto_stock = st.checkbox(
-                "Auto-stock with 5 essential relief items (Rice, Water, Medicine, Blankets, Tents) — pulled from Central Inventory",
-                value=True
+        else:
+            save_weather_reading(api_result)
+
+            icon_url = f"https://openweathermap.org/img/wn/{api_result['icon']}@2x.png"
+            wcol1, wcol2 = st.columns([1, 3])
+            with wcol1:
+                st.image(icon_url)
+            with wcol2:
+                st.subheader(f"Weather in {api_result['city']}")
+                st.write(f"☁️ {api_result['description'].title()}")
+
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("Temperature", f"{api_result['temperature']}°C")
+            m2.metric("Feels Like", f"{api_result['feels_like']}°C")
+            m3.metric("Humidity", f"{api_result['humidity']}%")
+            m4.metric("Wind Speed", f"{api_result['wind_speed']} m/s")
+            m5.metric("Rainfall (1h)", f"{api_result['rainfall']} mm")
+            m6.metric("Pressure", f"{api_result['pressure']} hPa")
+            st.caption(f"Last updated: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+
+            st.divider()
+            st.subheader("🚨 Risk Assessment")
+
+            district_terrain, _ = risk.get_terrain(city)
+            result = risk.predict_from_weather_api(
+                api_result,
+                wind_unit="m/s",
+                rainfall_mm_24h=manual_rainfall if use_manual_rainfall else None,
+                terrain=district_terrain,
             )
-            if st.button("Add Shelter"):
-                if occupancy > capacity:
-                    st.error(
-                        f"Occupancy ({occupancy}) cannot exceed capacity ({capacity}). "
-                        f"Lower the occupancy or raise the capacity."
-                    )
-                elif not shelter_name:
-                    st.warning("Shelter name is required.")
+
+            if "error" in result:
+                st.error(f"Risk engine could not assess this reading: {result['error']}")
+            else:
+                level_color = {"Low": "🟢", "Moderate": "🟡", "High": "🟠", "Severe": "🔴"}
+                r1, r2, r3 = st.columns(3)
+                r1.metric("Overall Risk Level", f"{level_color.get(result['risk_level'], '')} {result['risk_level']}")
+                r2.metric("Risk Score", f"{result['risk_score']} / 100")
+                r3.metric("Primary Hazard", result["disaster_type"])
+
+                for warning in result.get("warnings", []):
+                    st.info(f"ℹ️ {warning}")
+
+                if result["all_hazards"]:
+                    st.markdown("**Hazard breakdown**")
+                    hazard_df = pd.DataFrame(result["all_hazards"])[["disaster_type", "risk_score", "risk_level", "reason"]]
+                    hazard_df.columns = ["Hazard", "Score", "Level", "Reason"]
+                    st.dataframe(hazard_df, use_container_width=True, hide_index=True)
                 else:
-                    new_shelter_id = dm.add_shelter(district_id, shelter_name, capacity, occupancy)
-                    st.success(f"Shelter '{shelter_name}' added.")
-                    if auto_stock:
-                        stock_messages = im.seed_shelter_essentials(new_shelter_id, capacity, district_id=district_id)
-                        # Stash in session_state so it survives the rerun below
-                        # and is visible above, instead of flashing on screen.
-                        st.session_state["last_stock_messages"] = stock_messages
-                        st.session_state["last_stock_shelter_name"] = shelter_name
-                    st.rerun()
+                    st.success("No hazard thresholds were exceeded by this reading.")
 
-        st.subheader(f"Shelters in {selected_name}")
-        shelters = dm.get_shelters(district_id)
-        for s in shelters:
-            shelter_id, d_id, s_name, cap, occ = s
-            col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
-            col1.write(s_name)
-            col2.write(f"Capacity: {cap}")
-            fill_pct = f" ({occ / cap:.0%} full)" if cap else ""
-            col3.write(f"Occupancy: {occ}{fill_pct}")
-            if col4.button("Delete", key=f"del_shel_{shelter_id}"):
-                dm.delete_shelter(shelter_id)
-                st.rerun()
+                with st.expander("Recommended actions"):
+                    for line in result["recommendations"]:
+                        st.markdown(f"- {line}")
 
-            # This is the part that was missing entirely: showing what stock
-            # actually sits at this shelter after auto-stocking or manual
-            # allocation, instead of only being visible as a deduction from
-            # the district/central inventory numbers.
-            with st.expander(f"View stock at {s_name}"):
-                shelter_items = im.get_shelter_inventory(shelter_id)
-                if shelter_items:
-                    for item in shelter_items:
-                        item_id, sku, i_d_id, i_s_id, i_name, qty, unit, threshold, last_restocked = item
-                        ic1, ic2, ic3, ic4 = st.columns([2, 2, 2, 1])
-                        ic1.write(i_name)
-                        ic2.write(f"{qty:,} {unit}")
-                        ic3.write(f"Last restocked: {last_restocked}")
-                        if qty <= threshold:
-                            ic4.error("Low")
+                if result["event_triggered"]:
+                    st.warning(f"🔔 This reading triggered a **{result['risk_level']}** event and has been logged.")
+
+                    existing = {d[1]: d[0] for d in get_districts()}
+                    district_name = city
+                    if district_name not in existing:
+                        add_district(district_name, province="Unknown", population=0, terrain=result["terrain"])
+                        existing = {d[1]: d[0] for d in get_districts()}
+
+                    district_id = existing[district_name]
+                    add_event(
+                        district_id=district_id,
+                        disaster_type=result["disaster_type"],
+                        event_date=result["event"]["event_date"],
+                        risk_level=result["risk_level"],
+                        description=result["reason"],
+                    )
+
+    st.divider()
+    st.subheader(f"Recent Weather History for {weather_query_name}")
+    history = get_weather_history(city=weather_query_name, limit=10)
+    if history:
+        df = pd.DataFrame(history, columns=[
+            "ID", "City", "Timestamp", "Temp (°C)", "Feels Like (°C)",
+            "Humidity (%)", "Pressure (hPa)", "Wind Speed (m/s)",
+            "Rainfall (mm)", "Description", "Icon",
+        ])
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"]).dt.strftime("%d-%m-%Y %H:%M")
+        df["Description"] = df["Description"].str.title()
+        display_df = df[["Timestamp", "Temp (°C)", "Feels Like (°C)", "Humidity (%)",
+                          "Rainfall (mm)", "Wind Speed (m/s)", "Pressure (hPa)", "Description"]]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No history yet for this city. Click 'Get Weather & Assess Risk' to start logging.")
+
+
+# Districts & Shelters
+def page_districts_shelters():
+    st.title("🏘️ Districts & Shelters")
+
+    tab_districts, tab_shelters = st.tabs(["Districts", "Shelters"])
+
+    with tab_districts:
+        districts = get_districts()
+        if districts:
+            df = pd.DataFrame(districts, columns=DISTRICT_COLS)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No districts yet.")
+
+        with st.expander("➕ Add a district"):
+            with st.form("add_district_form", clear_on_submit=True):
+                c1, c2 = st.columns(2)
+                name = c1.text_input("Name")
+                province = c2.text_input("Province")
+                c3, c4 = st.columns(2)
+                population = c3.number_input("Population", min_value=0, step=1)
+                terrain = c4.selectbox("Terrain", ["mountain", "hill", "valley", "terai"])
+                vulnerability = st.selectbox("Vulnerability Level", ["Low", "Moderate", "High", "Unknown"])
+                if st.form_submit_button("Add District", type="primary"):
+                    if not name.strip():
+                        st.error("Name is required.")
+                    else:
+                        add_district(name.strip(), province.strip(), int(population), terrain, vulnerability)
+                        st.success(f"Added {name}.")
+                        st.rerun()
+
+        if districts:
+            with st.expander("✏️ Edit or delete a district"):
+                names = {f"{d[1]} (ID {d[0]})": d for d in districts}
+                choice = st.selectbox("Select district", list(names.keys()), key="edit_district_select")
+                d = names[choice]
+                with st.form("edit_district_form"):
+                    c1, c2 = st.columns(2)
+                    e_name = c1.text_input("Name", value=d[1])
+                    e_province = c2.text_input("Province", value=d[2] or "")
+                    c3, c4 = st.columns(2)
+                    e_population = c3.number_input("Population", min_value=0, step=1, value=d[3] or 0)
+                    terrain_options = ["mountain", "hill", "valley", "terai"]
+                    e_terrain = c4.selectbox("Terrain", terrain_options,
+                                              index=terrain_options.index(d[4]) if d[4] in terrain_options else 0)
+                    vuln_options = ["Low", "Moderate", "High", "Unknown"]
+                    e_vulnerability = st.selectbox("Vulnerability Level", vuln_options,
+                                                    index=vuln_options.index(d[8]) if d[8] in vuln_options else 3)
+                    b1, b2 = st.columns(2)
+                    if b1.form_submit_button("Save Changes", type="primary"):
+                        update_district(d[0], e_name.strip(), e_province.strip(), int(e_population), e_terrain, e_vulnerability)
+                        st.success("Updated.")
+                        st.rerun()
+                    if b2.form_submit_button("🗑️ Delete District"):
+                        delete_district(d[0])
+                        st.warning(f"Deleted {d[1]}.")
+                        st.rerun()
+
+    with tab_shelters:
+        districts = get_districts()
+        if not districts:
+            st.info("Add a district first before creating shelters.")
+        else:
+            district_names = {f"{d[1]} (ID {d[0]})": d[0] for d in districts}
+            selected_label = st.selectbox("Filter by district", ["All districts"] + list(district_names.keys()))
+            selected_district_id = None if selected_label == "All districts" else district_names[selected_label]
+
+            shelters = get_shelters(selected_district_id)
+            if shelters:
+                shelter_df = pd.DataFrame(shelters, columns=["ID", "District ID", "Name", "Capacity", "Current Occupancy"])
+                shelter_df["Occupancy %"] = (shelter_df["Current Occupancy"] / shelter_df["Capacity"].replace(0, pd.NA) * 100).round(1)
+                st.dataframe(shelter_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No shelters found for this filter.")
+
+            with st.expander("➕ Add a shelter (auto-stocks with essential relief items)"):
+                with st.form("add_shelter_form", clear_on_submit=True):
+                    target_district_label = st.selectbox("District", list(district_names.keys()), key="new_shelter_district")
+                    target_district_id = district_names[target_district_label]
+                    s_name = st.text_input("Shelter Name")
+                    c1, c2 = st.columns(2)
+                    s_capacity = c1.number_input("Capacity", min_value=1, step=1, value=100)
+                    s_occupancy = c2.number_input("Current Occupancy", min_value=0, step=1, value=0)
+                    if st.form_submit_button("Add Shelter", type="primary"):
+                        if not s_name.strip():
+                            st.error("Shelter name is required.")
+                        elif s_occupancy > s_capacity:
+                            st.error("Occupancy cannot exceed capacity.")
                         else:
-                            ic4.success("OK")
-                else:
-                    st.info("No stock recorded at this shelter yet.")
+                            new_shelter_id = add_shelter(target_district_id, s_name.strip(), int(s_capacity), int(s_occupancy))
+                            messages = seed_shelter_essentials(new_shelter_id, int(s_capacity), target_district_id)
+                            st.success(f"Added shelter '{s_name}' and stocked it from central inventory.")
+                            for m in messages:
+                                st.caption(f"• {m}")
+                            st.rerun()
 
-                # Manual top-up: previously the only way stock ever reached a
-                # shelter was the one-time auto-stock at creation. This lets you
-                # add more of any central item to an existing shelter any time
-                # (e.g. the auto-stocked amount of Medicine Kits turns out to be
-                # too little once you know more about the situation on the ground).
-                st.markdown("**Add stock to this shelter**")
-                central_items_for_shelter = im.get_central_inventory()
-                if not central_items_for_shelter:
-                    st.caption("No central inventory items available to allocate.")
-                else:
-                    shelter_item_lookup = {
-                        f"{it[4]} — {it[5]:,} {it[6]} available": it for it in central_items_for_shelter
-                    }
-                    shelter_item_choice = st.selectbox(
-                        "Item", list(shelter_item_lookup.keys()), key=f"shelter_item_select_{shelter_id}"
-                    )
-                    chosen = shelter_item_lookup[shelter_item_choice]
-                    _, _, _, _, chosen_name, chosen_qty, chosen_unit, chosen_threshold, _ = chosen
-                    headroom = max(chosen_qty - chosen_threshold, 0)
-                    st.caption(
-                        f"{chosen_qty:,} {chosen_unit} in central stock · minimum reserve: {chosen_threshold:,} {chosen_unit} · "
-                        f"safely allocatable: {headroom:,} {chosen_unit}"
-                    )
-                    shelter_add_qty = st.number_input(
-                        "Quantity to add", min_value=0, step=1, key=f"shelter_add_qty_{shelter_id}"
-                    )
-                    shelter_allow_dip = st.checkbox(
-                        "Allow dipping into central reserve", value=False, key=f"shelter_allow_dip_{shelter_id}"
-                    )
-                    if st.button("Add Stock", key=f"shelter_add_stock_btn_{shelter_id}"):
-                        if shelter_add_qty > 0:
-                            success, message, amount = im.allocate_from_central_to_shelter(
-                                item_name=chosen_name,
-                                shelter_id=shelter_id,
-                                district_id=district_id,
-                                quantity=shelter_add_qty,
-                                low_stock_threshold=chosen_threshold,
-                                allow_reserve_dip=shelter_allow_dip,
-                            )
-                            if success:
-                                st.success(message)
-                                st.rerun()
+            if shelters:
+                with st.expander("✏️ Edit / delete a shelter, or view its stock"):
+                    shelter_names = {f"{s[2]} (ID {s[0]})": s for s in shelters}
+                    s_choice = st.selectbox("Select shelter", list(shelter_names.keys()))
+                    s = shelter_names[s_choice]
+
+                    with st.form("edit_shelter_form"):
+                        es_name = st.text_input("Name", value=s[2])
+                        c1, c2 = st.columns(2)
+                        es_capacity = c1.number_input("Capacity", min_value=1, step=1, value=s[3])
+                        es_occupancy = c2.number_input("Current Occupancy", min_value=0, step=1, value=s[4])
+                        b1, b2 = st.columns(2)
+                        if b1.form_submit_button("Save Changes", type="primary"):
+                            if es_occupancy > es_capacity:
+                                st.error("Occupancy cannot exceed capacity.")
                             else:
-                                st.error(message)
-                        else:
-                            st.warning("Enter a quantity greater than 0.")
+                                update_shelter(s[0], es_name.strip(), int(es_capacity), int(es_occupancy))
+                                st.success("Updated.")
+                                st.rerun()
+                        if b2.form_submit_button("🗑️ Delete Shelter"):
+                            delete_shelter(s[0])
+                            st.warning(f"Deleted {s[2]}.")
+                            st.rerun()
 
-# ---------------- Inventory Management ----------------
-elif page == "Inventory Management":
-    st.header("Relief Inventory Management")
+                    st.markdown("**Current stock at this shelter**")
+                    stock = get_shelter_inventory(s[0])
+                    if stock:
+                        stock_df = pd.DataFrame(stock, columns=["Item ID", "SKU", "District ID", "Shelter ID",
+                                                                  "Item", "Quantity", "Unit", "Low Stock Threshold", "Last Restocked"])
+                        st.dataframe(stock_df[["Item", "Quantity", "Unit", "Low Stock Threshold", "Last Restocked"]],
+                                     use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No stock recorded for this shelter yet.")
 
-    # ---- Central / National Inventory ----
-    st.subheader("Central / National Inventory")
-    central_items = im.get_central_inventory()
-    if central_items:
-        for item in central_items:
-            item_id, sku, d_id, s_id, i_name, qty, unit, threshold, last_restocked = item
-            col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 1])
-            col1.write(f"{i_name} ({sku})" if sku else i_name)
-            col2.write(f"{qty:,} {unit}")
-            col3.write(f"Min: {threshold:,}")
-            col4.write(f"Last restocked: {last_restocked}")
-            if qty <= threshold:
-                col5.error("Low")
-            else:
-                col5.success("OK")
-    else:
-        st.info("No central inventory data found.")
 
-    with st.expander("Restock an Existing Central Item"):
-        if central_items:
-            item_lookup = {f"{it[4]} ({it[6]})": it[0] for it in central_items}
-            item_to_restock = st.selectbox("Select item", list(item_lookup.keys()), key="central_restock_select")
-            restock_amt = st.number_input("Amount to add", min_value=0, step=100, key="central_restock_amt")
-            if st.button("Restock Central Item"):
-                if restock_amt > 0:
-                    im.restock_item(item_lookup[item_to_restock], restock_amt)
-                    st.success(f"Restocked {restock_amt} units.")
-                    st.rerun()
-                else:
-                    st.warning("Enter an amount greater than 0.")
-        else:
-            st.info("No central items to restock yet — add one below.")
+# Inventory
+def page_inventory():
+    st.title("📦 Relief Inventory")
 
-    with st.expander("Add a New Item Type to Central Inventory"):
-        new_central_name = st.text_input("Item Name", key="new_central_name")
-        new_central_qty = st.number_input("Starting Quantity", min_value=0, step=100, key="new_central_qty")
-        new_central_unit = st.text_input("Unit (e.g. kg, liters, pieces)", key="new_central_unit")
-        new_central_threshold = st.number_input("Low Stock Threshold", min_value=0, step=50, value=100, key="new_central_threshold")
-        new_central_sku = st.text_input("SKU / Item Code (optional)", key="new_central_sku")
-        if st.button("Add to Central Inventory"):
-            if new_central_name and new_central_unit:
-                im.add_central_item(
-                    new_central_name, new_central_qty, new_central_unit,
-                    new_central_threshold, sku=new_central_sku or None
-                )
-                st.success(f"'{new_central_name}' added to central inventory.")
-                st.rerun()
-            else:
-                st.warning("Item name and unit are required.")
+    tab_central, tab_allocate, tab_low = st.tabs(["Central Stock", "Allocate", "Low Stock Alerts"])
 
-    st.divider()
-
-    # ---- Allocate stock from Central to a District ----
-    st.subheader("Allocate Stock to a District")
-    districts = dm.get_districts()
-    if not districts:
-        st.warning("Add a district first.")
-    elif not central_items:
-        st.warning("Add central inventory items first before allocating.")
-    else:
-        district_options = {d[1]: d[0] for d in districts}
-        selected_name = st.selectbox("Select District", list(district_options.keys()), key="alloc_district_select")
-        district_id = district_options[selected_name]
-
-        item_lookup = {f"{it[4]} — {it[5]:,} {it[6]} available": it[0] for it in central_items}
-        item_to_allocate = st.selectbox("Select Item from Central Stock", list(item_lookup.keys()), key="alloc_item_select")
-
-        # Show how much can be allocated before central stock dips below its
-        # own minimum reserve, so it's not possible to unknowingly dump the
-        # entire central supply into one district.
-        selected_central = next(it for it in central_items if it[0] == item_lookup[item_to_allocate])
-        _, _, _, _, sel_name, sel_qty, sel_unit, sel_threshold, _ = selected_central
-        headroom = max(sel_qty - sel_threshold, 0)
-        st.caption(
-            f"{sel_qty:,} {sel_unit} in central stock · minimum reserve: {sel_threshold:,} {sel_unit} · "
-            f"safely allocatable without touching reserve: {headroom:,} {sel_unit}"
-        )
-
-        alloc_qty = st.number_input("Quantity to Allocate", min_value=0, step=10, key="alloc_qty")
-        allow_reserve_dip = st.checkbox(
-            "Allow dipping into central reserve (only for a genuine emergency allocation)",
-            value=False, key="alloc_allow_reserve_dip"
-        )
-
-        if st.button("Allocate to District"):
-            if alloc_qty > 0:
-                success, message = im.allocate_from_central(
-                    item_lookup[item_to_allocate], district_id, alloc_qty,
-                    allow_reserve_dip=allow_reserve_dip
-                )
-                if success:
-                    st.success(message)
-                    st.rerun()
-                else:
-                    st.error(message)
-            else:
-                st.warning("Enter a quantity greater than 0.")
-
-    st.divider()
-
-    # ---- District-level Inventory (view only, shows what's been allocated) ----
-    st.subheader("District-Level Inventory")
-    if districts:
-        view_district_name = st.selectbox("View District", list(district_options.keys()), key="view_district_select")
-        view_district_id = district_options[view_district_name]
-
-        items = im.get_inventory(view_district_id)
+    with tab_central:
+        items = get_central_inventory()
         if items:
-            for item in items:
-                item_id, sku, d_id, s_id, i_name, qty, unit, threshold, last_restocked = item
-                col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
-                col1.write(i_name)
-                col2.write(f"{qty} {unit}")
-                if qty <= threshold:
-                    col3.error("Low stock")
-                else:
-                    col3.success("OK")
-                if col4.button("Delete", key=f"del_item_{item_id}"):
-                    im.delete_item(item_id)
-                    st.rerun()
+            df = pd.DataFrame(items, columns=INV_COLS)
+            st.dataframe(df[["SKU", "Item", "Quantity", "Unit", "Low Stock Threshold", "Last Restocked"]],
+                         use_container_width=True, hide_index=True)
         else:
-            st.info(f"No stock allocated to {view_district_name} yet. Use 'Allocate Stock to a District' above.")
+            st.info("No central inventory yet.")
 
-    st.divider()
+        with st.expander("➕ Add a new central item"):
+            with st.form("add_item_form", clear_on_submit=True):
+                c1, c2 = st.columns(2)
+                i_name = c1.text_input("Item Name")
+                i_unit = c2.text_input("Unit", value="units")
+                c3, c4 = st.columns(2)
+                i_qty = c3.number_input("Starting Quantity", min_value=0, step=1)
+                i_threshold = c4.number_input("Low Stock Threshold", min_value=0, step=1, value=10)
+                i_sku = st.text_input("SKU (optional, auto-generated if left blank)")
+                if st.form_submit_button("Add Item", type="primary"):
+                    if not i_name.strip():
+                        st.error("Item name is required.")
+                    else:
+                        sku = i_sku.strip() or None
+                        add_central_item(i_name.strip(), int(i_qty), i_unit.strip(), int(i_threshold), sku)
+                        st.success(f"Added {i_name} to central inventory.")
+                        st.rerun()
 
-    # ---- Low Stock Alerts ----
-    st.subheader("Low Stock Alerts (All Items)")
-    low_items = im.get_low_stock_items()
-    if low_items:
-        shelter_lookup = {s[0]: s[2] for s in dm.get_shelters()}
-        district_lookup = {d[0]: d[1] for d in districts} if districts else {}
-        for li in low_items:
-            li_item_id, li_sku, li_d_id, li_s_id, li_name, li_qty, li_unit, li_threshold, li_last_restocked = li
-            if li_s_id:
-                location = f"Shelter: {shelter_lookup.get(li_s_id, li_s_id)}"
-            elif li_d_id:
-                location = f"District: {district_lookup.get(li_d_id, li_d_id)}"
+        if items:
+            with st.expander("✏️ Restock / edit / delete an item"):
+                item_names = {f"{it[4]} ({it[1] or 'no SKU'})": it for it in items}
+                choice = st.selectbox("Select item", list(item_names.keys()))
+                it = item_names[choice]
+
+                r1, r2 = st.columns(2)
+                with r1:
+                    st.markdown("**Restock**")
+                    add_amount = st.number_input("Amount to add", min_value=0, step=1, key="restock_amount")
+                    if st.button("Restock", type="primary"):
+                        restock_item(it[0], int(add_amount))
+                        st.success(f"Added {add_amount} {it[6]} to {it[4]}.")
+                        st.rerun()
+
+                with r2:
+                    st.markdown("**Edit details**")
+                    with st.form("edit_item_form"):
+                        e_name = st.text_input("Item Name", value=it[4])
+                        e_qty = st.number_input("Quantity", min_value=0, step=1, value=it[5])
+                        e_unit = st.text_input("Unit", value=it[6])
+                        e_threshold = st.number_input("Low Stock Threshold", min_value=0, step=1, value=it[7])
+                        b1, b2 = st.columns(2)
+                        if b1.form_submit_button("Save"):
+                            update_item(it[0], e_name.strip(), int(e_qty), e_unit.strip(), int(e_threshold))
+                            st.success("Updated.")
+                            st.rerun()
+                        if b2.form_submit_button("🗑️ Delete"):
+                            delete_item(it[0])
+                            st.warning(f"Deleted {it[4]}.")
+                            st.rerun()
+
+    with tab_allocate:
+        st.caption("Move stock from central/national reserve to a district or directly to a shelter.")
+        items = get_central_inventory()
+        districts = get_districts()
+
+        if not items:
+            st.info("No central inventory to allocate from yet.")
+        elif not districts:
+            st.info("Add a district first.")
+        else:
+            target_type = st.radio("Allocate to", ["District", "Shelter"], horizontal=True)
+            item_names = {f"{it[4]} — {it[5]} {it[6]} available": it for it in items}
+            item_choice = st.selectbox("Item", list(item_names.keys()))
+            chosen_item = item_names[item_choice]
+
+            district_names = {f"{d[1]} (ID {d[0]})": d[0] for d in districts}
+
+            if target_type == "District":
+                dist_choice = st.selectbox("District", list(district_names.keys()))
+                qty = st.number_input("Quantity to allocate", min_value=1, step=1)
+                allow_dip = st.checkbox("Allow dipping into minimum reserve (emergency override)")
+                if st.button("Allocate to District", type="primary"):
+                    success, message = allocate_from_central(chosen_item[0], district_names[dist_choice], int(qty), allow_dip)
+                    (st.success if success else st.error)(message)
+                    if success:
+                        st.rerun()
             else:
-                location = "Central Stock"
-            st.warning(f"{li_name} is low at {location}: {li_qty} {li_unit} left (min: {li_threshold})")
-    else:
-        st.info("No low stock items currently.")
+                dist_choice = st.selectbox("District (for the shelter's location)", list(district_names.keys()))
+                shelters = get_shelters(district_names[dist_choice])
+                if not shelters:
+                    st.info("This district has no shelters yet.")
+                else:
+                    shelter_names = {f"{s[2]} (ID {s[0]})": s[0] for s in shelters}
+                    shelter_choice = st.selectbox("Shelter", list(shelter_names.keys()))
+                    qty = st.number_input("Quantity to allocate", min_value=1, step=1)
+                    allow_dip = st.checkbox("Allow dipping into minimum reserve (emergency override)", key="shelter_dip")
+                    if st.button("Allocate to Shelter", type="primary"):
+                        success, message, amount = allocate_from_central_to_shelter(
+                            item_name=chosen_item[4],
+                            shelter_id=shelter_names[shelter_choice],
+                            district_id=district_names[dist_choice],
+                            quantity=int(qty),
+                            allow_reserve_dip=allow_dip,
+                        )
+                        (st.success if success else st.error)(message)
+                        if success:
+                            st.rerun()
 
-# ---------------- Disaster Events ----------------
-elif page == "Disaster Events":
-    st.header("Disaster Event Records")
+    with tab_low:
+        low_items = get_low_stock_items()
+        if low_items:
+            st.warning(f"{len(low_items)} item(s) are at or below their low-stock threshold.")
+            df = pd.DataFrame(low_items, columns=INV_COLS)
+            st.dataframe(df[["SKU", "Item", "Quantity", "Unit", "Low Stock Threshold", "Last Restocked"]],
+                         use_container_width=True, hide_index=True)
+        else:
+            st.success("Nothing is currently low on stock, anywhere in the system.")
 
-    districts = dm.get_districts()
-    if not districts:
-        st.warning("Add a district first.")
-    else:
-        district_options = {d[1]: d[0] for d in districts}
-        selected_name = st.selectbox("Select District", list(district_options.keys()))
-        district_id = district_options[selected_name]
 
-        with st.expander("Log New Disaster Event"):
-            disaster_type = st.selectbox("Disaster Type", ["Flood", "Landslide", "Storm", "Heatwave"])
-            event_date = st.date_input("Event Date", value=datetime.date.today())
-            risk_level = st.selectbox("Risk Level", ["Low", "Moderate", "High", "Severe"])
-            description = st.text_area("Description (optional)")
-            if st.button("Log Event"):
-                de.add_event(district_id, disaster_type, str(event_date), risk_level, description)
-                st.success(f"{disaster_type} event logged for {selected_name}.")
+# Relief Planning
+MEALS_PER_PERSON = 2
+WATER_LITERS_PER_PERSON = 3
+PEOPLE_PER_MEDICINE_KIT = 25
+KG_RICE_PER_MEAL_PACK = 0.25
+
+
+@st.cache_data
+def load_district_csv():
+    return pd.read_csv(DISTRICT_CSV)
+
+
+@st.cache_data
+def load_inventory_csv():
+    return pd.read_csv(INVENTORY_CSV)
+
+
+def calculate_aid_needed(population):
+    meal_packs_needed = population * MEALS_PER_PERSON
+    rice_kg_needed = meal_packs_needed * KG_RICE_PER_MEAL_PACK
+    water_liters_needed = population * WATER_LITERS_PER_PERSON
+    medicine_kits_needed = math.ceil(population / PEOPLE_PER_MEDICINE_KIT)
+    return {
+        "Food (meal packs)": meal_packs_needed,
+        "Food (rice kg equivalent)": rice_kg_needed,
+        "Water (litres)": water_liters_needed,
+        "Medicine (kits)": medicine_kits_needed,
+    }
+
+
+def get_stock_csv(inventory_df, item_name):
+    row = inventory_df[inventory_df["Item"] == item_name]
+    return 0.0 if row.empty else float(row["Current_Quantity"].iloc[0])
+
+
+def build_allocation_report(aid_needed, inventory_df):
+    rows = [
+        {"Category": "Food", "Inventory Item": "Rice", "Unit": "kg",
+         "Needed": round(aid_needed["Food (rice kg equivalent)"], 1), "Available": get_stock_csv(inventory_df, "Rice")},
+        {"Category": "Water", "Inventory Item": "Water", "Unit": "liters",
+         "Needed": round(aid_needed["Water (litres)"], 1), "Available": get_stock_csv(inventory_df, "Water")},
+        {"Category": "Medicine", "Inventory Item": "Medicine Kits", "Unit": "kits",
+         "Needed": aid_needed["Medicine (kits)"], "Available": get_stock_csv(inventory_df, "Medicine Kits")},
+    ]
+    report = pd.DataFrame(rows)
+    report["Allocated"] = report[["Needed", "Available"]].min(axis=1)
+    report["Shortage"] = (report["Needed"] - report["Available"]).clip(lower=0)
+    report["Surplus"] = (report["Available"] - report["Needed"]).clip(lower=0)
+    report["Coverage %"] = (report["Allocated"] / report["Needed"] * 100).round(1)
+    report["Stock Used %"] = (report["Allocated"] / report["Available"].replace(0, float("nan")) * 100).round(1).fillna(0)
+    report["Status"] = report["Shortage"].apply(lambda v: "⚠️ SHORTAGE" if v > 0 else "✅ SUFFICIENT")
+    report["Priority"] = report.apply(lambda row: get_priority(row["Shortage"], row["Needed"]), axis=1)
+    return report
+
+
+def get_priority(shortage, needed):
+    if shortage <= 0:
+        return "🟢 Covered"
+    pct = shortage / needed * 100
+    if pct > 50:
+        return "🔴 Critical"
+    if pct > 20:
+        return "🟠 Moderate"
+    return "🟡 Minor"
+
+
+def build_reallocation_report(district_df, affected_percent):
+    rows = []
+    for _, row in district_df.iterrows():
+        population = int(row["Population"])
+        people_affected = round(population * affected_percent / 100)
+        aid = calculate_aid_needed(people_affected)
+        rows.append({
+            "District": row["District"],
+            "Population": population,
+            "People Affected": people_affected,
+            "Rice Needed (kg)": round(aid["Food (rice kg equivalent)"], 1),
+            "Water Needed (L)": aid["Water (litres)"],
+            "Medicine Kits Needed": aid["Medicine (kits)"],
+        })
+    result = pd.DataFrame(rows)
+    return result.sort_values("People Affected", ascending=False).reset_index(drop=True)
+
+
+def page_relief_planning():
+    st.title("🧺 Relief Requirements & Allocation")
+    st.caption("Calculate relief requirements from an affected population and compare against current stock levels.")
+
+    district_df = load_district_csv()
+    inventory_df = load_inventory_csv()
+
+    tab1, tab2 = st.tabs(["1️⃣ Requirements & Allocation", "2️⃣ Final Allocation & Shortage Analysis"])
+
+    with tab1:
+        st.subheader("1. Select Affected District")
+        district_names = sorted(district_df["District"].dropna().unique())
+        district_name = st.selectbox("District", district_names)
+        district_row = district_df[district_df["District"] == district_name].iloc[0]
+        population = int(district_row["Population"])
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("District Population", f"{population:,}")
+        c2.metric("Province", district_row["Province"])
+        c3.metric("Shelters", f"{int(district_row['Shelters']):,}")
+
+        st.subheader("2. Determine Affected Population")
+        affected_percent = st.slider("Percentage of district population affected", 1, 100, 50, 1, format="%d%%")
+        people_affected = round(population * affected_percent / 100)
+        st.info(f"**{people_affected:,} people** are affected ({affected_percent}% of the district population).")
+
+        st.subheader("3. Relief Required")
+        aid_needed = calculate_aid_needed(people_affected)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Food", f"{aid_needed['Food (meal packs)']:,} meal packs")
+        c2.metric("Water", f"{aid_needed['Water (litres)']:,} litres")
+        c3.metric("Medicine", f"{aid_needed['Medicine (kits)']:,} kits")
+
+        with st.expander("View calculation rules"):
+            st.markdown(f"""
+            - **Food:** {MEALS_PER_PERSON} meal packs per person
+            - **Water:** {WATER_LITERS_PER_PERSON} litres per person
+            - **Medicine:** 1 kit per {PEOPLE_PER_MEDICINE_KIT} people, rounded up
+            - **Food inventory comparison:** 1 meal pack ≈ {KG_RICE_PER_MEAL_PACK} kg rice
+            """)
+
+        st.subheader("4. Available Inventory & Allocation")
+        report = build_allocation_report(aid_needed, inventory_df)
+        display_report = report[["Category", "Inventory Item", "Unit", "Needed", "Available",
+                                  "Allocated", "Shortage", "Surplus", "Coverage %", "Status"]]
+        st.dataframe(display_report, use_container_width=True, hide_index=True)
+
+        shortage_count = int((report["Shortage"] > 0).sum())
+        total_shortage = report["Shortage"].sum()
+        if shortage_count == 0:
+            st.success("All calculated relief requirements can be covered by the current inventory.")
+        else:
+            st.warning(f"{shortage_count} item(s) have a shortage. Total shortage: {total_shortage:,.1f} units.")
+
+        st.subheader("5. Allocation Summary")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Required", f"{report['Needed'].sum():,.1f}")
+        c2.metric("Total Allocated", f"{report['Allocated'].sum():,.1f}")
+        c3.metric("Total Shortage", f"{report['Shortage'].sum():,.1f}")
+        c4.metric("Total Surplus", f"{report['Surplus'].sum():,.1f}")
+
+        if st.button("Update Final Analysis", type="primary"):
+            st.session_state["rp_selected_district"] = district_name
+            st.session_state["rp_affected_percent"] = affected_percent
+            st.session_state["rp_people_affected"] = people_affected
+            st.session_state["rp_allocation_report"] = report
+            st.success("Final allocation analysis updated. Open the 'Final Allocation & Shortage Analysis' tab.")
+
+        st.caption("The final analysis tab uses the current slider value at the time you click the button above.")
+
+    with tab2:
+        report = st.session_state.get("rp_allocation_report")
+
+        if report is None:
+            st.info("No allocation has been calculated yet. Go to tab 1, select a district, adjust the slider, "
+                    "and click 'Update Final Analysis'.")
+        else:
+            district = st.session_state["rp_selected_district"]
+            affected_percent = st.session_state["rp_affected_percent"]
+            people_affected = st.session_state["rp_people_affected"]
+
+            st.subheader("Current Scenario")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("District", district)
+            c2.metric("Affected Population", f"{people_affected:,}")
+            c3.metric("Population Affected", f"{affected_percent}%")
+            st.caption(f"Analysis generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            st.divider()
+
+            total_required = report["Needed"].sum()
+            total_allocated = report["Allocated"].sum()
+            total_shortage = report["Shortage"].sum()
+            total_surplus = report["Surplus"].sum()
+            average_coverage = report["Coverage %"].mean()
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Required", f"{total_required:,.1f}")
+            c2.metric("Allocated", f"{total_allocated:,.1f}")
+            c3.metric("Shortage", f"{total_shortage:,.1f}")
+            c4.metric("Surplus", f"{total_surplus:,.1f}")
+            c5.metric("Avg. Coverage", f"{average_coverage:.1f}%")
+
+            st.subheader("Final Allocation")
+            st.dataframe(report[["Category", "Inventory Item", "Unit", "Needed", "Available", "Allocated"]],
+                         use_container_width=True, hide_index=True)
+
+            st.subheader("Shortage & Surplus Results")
+            st.dataframe(report[["Category", "Inventory Item", "Unit", "Shortage", "Surplus", "Coverage %", "Priority", "Status"]],
+                         use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.subheader("Resource Comparison")
+            chart_data = report[["Inventory Item", "Needed", "Available", "Allocated"]].melt(
+                id_vars="Inventory Item", var_name="Resource Status", value_name="Quantity")
+            st.plotly_chart(px.bar(chart_data, x="Inventory Item", y="Quantity", color="Resource Status",
+                                    barmode="group", title="Required vs Available vs Allocated"),
+                             use_container_width=True)
+
+            st.subheader("Shortage Analysis")
+            shortage_data = report[report["Shortage"] > 0][["Inventory Item", "Shortage"]]
+            if shortage_data.empty:
+                st.success("No shortage exists for the current affected population.")
+            else:
+                st.plotly_chart(px.bar(shortage_data, x="Inventory Item", y="Shortage", title="Current Relief Shortages"),
+                                 use_container_width=True)
+                critical_items = report[report["Shortage"] > 0].sort_values("Shortage", ascending=False)
+                st.markdown("**Priority Shortages**")
+                st.dataframe(critical_items[["Inventory Item", "Needed", "Available", "Shortage", "Coverage %", "Priority"]],
+                             use_container_width=True, hide_index=True)
+
+            st.subheader("Allocation Coverage")
+            coverage_chart = px.bar(report, x="Inventory Item", y="Coverage %", text="Coverage %",
+                                     title="Percentage of Required Relief Covered")
+            coverage_chart.update_yaxes(range=[0, max(100, float(report["Coverage %"].max()) + 10)])
+            st.plotly_chart(coverage_chart, use_container_width=True)
+
+            st.subheader("Cross-District Need Ranking")
+            ranking = build_reallocation_report(district_df, affected_percent)
+            ranking["Selected District"] = ranking["District"].apply(lambda v: "⭐ Selected" if v == district else "")
+            st.dataframe(ranking, use_container_width=True, hide_index=True)
+
+            st.download_button("📥 Download Final Allocation Report", data=report.to_csv(index=False).encode("utf-8"),
+                                file_name=f"final_allocation_{district}.csv", mime="text/csv")
+
+
+# Disaster Events 
+def page_disaster_events():
+    st.title("📋 Disaster Events Log")
+    st.caption("Events logged automatically by the risk engine (High/Severe readings), plus any added manually below.")
+
+    districts = get_districts()
+    district_names = {d[0]: d[1] for d in districts}
+
+    filter_choice = st.selectbox("Filter by district", ["All districts"] + [d[1] for d in districts])
+    filter_id = None
+    if filter_choice != "All districts":
+        filter_id = next(d[0] for d in districts if d[1] == filter_choice)
+
+    events = get_events(filter_id)
+
+    if events:
+        df = pd.DataFrame(events, columns=["Event ID", "District ID", "Disaster Type", "Event Date", "Risk Level", "Description"])
+        df["District"] = df["District ID"].map(district_names)
+        display_df = df[["Event ID", "District", "Disaster Type", "Event Date", "Risk Level", "Description"]]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        with st.expander("🗑️ Delete an event"):
+            options = {f"#{e[0]} — {district_names.get(e[1], '?')} — {e[2]} ({e[3]})": e[0] for e in events}
+            choice = st.selectbox("Select event", list(options.keys()))
+            if st.button("Delete Event"):
+                delete_event(options[choice])
+                st.warning("Event deleted.")
                 st.rerun()
+    else:
+        st.info("No disaster events logged yet. High/Severe readings on the Weather & Risk page will appear here automatically.")
 
-        st.subheader(f"Event History for {selected_name}")
-        events = de.get_events(district_id)
-        for e in events:
-            event_id, d_id, d_type, e_date, risk, desc = e
-            col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 3, 1])
-            col1.write(d_type)
-            col2.write(e_date)
-            col3.write(risk)
-            col4.write(desc)
-            if col5.button("Delete", key=f"del_event_{event_id}"):
-                de.delete_event(event_id)
-                st.rerun()
-                
+    with st.expander("➕ Add an event manually"):
+        if not districts:
+            st.info("Add a district first.")
+        else:
+            with st.form("manual_event_form", clear_on_submit=True):
+                d_choice = st.selectbox("District", [d[1] for d in districts], key="manual_event_district")
+                d_id = next(d[0] for d in districts if d[1] == d_choice)
+                e_type = st.selectbox("Disaster Type", ["Flood", "Landslide", "Storm", "Heatwave", "Other"])
+                e_date = st.date_input("Event Date")
+                e_level = st.selectbox("Risk Level", ["Low", "Moderate", "High", "Severe"])
+                e_desc = st.text_area("Description")
+                if st.form_submit_button("Add Event", type="primary"):
+                    add_event(d_id, e_type, e_date.isoformat(), e_level, e_desc)
+                    st.success("Event added.")
+                    st.rerun()
+
+
+# Main
+PAGES = {
+    "🏠 Home": page_home,
+    "🌦️ Weather & Risk": page_weather_risk,
+    "🏘️ Districts & Shelters": page_districts_shelters,
+    "📦 Inventory": page_inventory,
+    "🧺 Relief Planning": page_relief_planning,
+    "📋 Disaster Events": page_disaster_events,
+}
+
+st.sidebar.title("🚨 Disaster Relief System")
+selection = st.sidebar.radio("Navigate", list(PAGES.keys()))
+st.sidebar.divider()
+st.sidebar.caption("app.py only — every other file in this project is untouched.")
+
+PAGES[selection]()
