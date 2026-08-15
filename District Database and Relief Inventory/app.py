@@ -951,6 +951,5 @@ PAGES = {
 st.sidebar.title("🚨 Disaster Relief System")
 selection = st.sidebar.radio("Navigate", list(PAGES.keys()))
 st.sidebar.divider()
-st.sidebar.caption("app.py only — every other file in this project is untouched.")
 
 PAGES[selection]()
