@@ -274,17 +274,17 @@ def page_weather_risk():
         st.info("Type in conditions directly -- this skips the weather API entirely, so no key is needed.")
 
         c1, c2, c3 = st.columns(3)
-        temperature = c1.number_input("Temperature (°C)", value=25.0, step=0.5)
+        temperature = c1.number_input("Temperature (°C)", min_value=-50.0, max_value=55.0, value=25.0, step=0.5)
         humidity = c2.number_input("Humidity (%)", min_value=0, max_value=100, value=60, step=1)
-        wind_speed = c3.number_input("Wind Speed (m/s)", min_value=0.0, value=3.0, step=0.5)
+        wind_speed = c3.number_input("Wind Speed (m/s)", min_value=0.0, max_value=69.4, value=3.0, step=0.5)
 
         c4, c5, c6 = st.columns(3)
-        rainfall_1h = c4.number_input("Rainfall - last 1 hour (mm)", min_value=0.0, value=0.0, step=1.0)
+        rainfall_1h = c4.number_input("Rainfall - last 1 hour (mm)", min_value=0.0, max_value=500.0, value=0.0, step=1.0)
         rainfall_24h = c5.number_input(
-            "Rainfall - last 24 hours (mm)", min_value=0.0, value=0.0, step=1.0,
+            "Rainfall - last 24 hours (mm)", min_value=0.0, max_value=500.0, value=0.0, step=1.0,
             help="This is the figure that actually drives the flood/landslide checks.",
         )
-        pressure = c6.number_input("Pressure (hPa)", min_value=800, max_value=1100, value=1010, step=1)
+        pressure = c6.number_input("Pressure (hPa)", min_value=870, max_value=1085, value=1010, step=1)
 
         description = st.text_input("Conditions description (optional, for your own notes)", "manually entered")
 
