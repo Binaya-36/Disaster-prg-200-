@@ -59,10 +59,11 @@ LEVEL_RANK = {"Low": 0, "Moderate": 1, "High": 2, "Severe": 3}
 EVENT_TRIGGER_LEVELS = ("High", "Severe")
 
 VALID_RANGES = {
-    "rainfall": (0.0, 2000.0),      
-    "temperature": (-60.0, 60.0),   
-    "humidity": (0.0, 100.0),       
-    "wind_speed": (0.0, 500.0),     
+    "rainfall": (0.0, 500.0),
+    "temperature": (-50.0, 55.0),
+    "humidity": (0.0, 100.0),
+    "wind_speed": (0.0, 250.0),
+    "pressure": (870.0, 1085.0),
 }
 
 # --- 1f. Misc ---
@@ -140,11 +141,11 @@ def list_known_districts():
     return sorted(name.title() for name in DISTRICT_TERRAIN)
 
 
-REQUIRED_FIELDS = ("rainfall", "temperature", "humidity", "wind_speed")
+REQUIRED_FIELDS = ("rainfall", "temperature", "humidity", "wind_speed", "pressure")
 
 FIELD_UNITS = {
     "rainfall": "mm", "temperature": "degrees C",
-    "humidity": "%", "wind_speed": "km/h",
+    "humidity": "%", "wind_speed": "km/h", "pressure": "hPa",
 }
 
 
@@ -738,7 +739,7 @@ def normalise_weather(api_result, wind_unit="m/s", rainfall_mm_24h=None):
     if "error" in api_result:
         raise WeatherDataError(f"Weather API error: {api_result['error']}")
 
-    needed = ("city", "temperature", "humidity", "wind_speed", "rainfall")
+    needed = ("city", "temperature", "humidity", "wind_speed", "rainfall", "pressure")
     missing = [key for key in needed if key not in api_result]
     if missing:
         raise WeatherDataError(
@@ -761,6 +762,7 @@ def normalise_weather(api_result, wind_unit="m/s", rainfall_mm_24h=None):
         "temperature": api_result["temperature"],
         "humidity": api_result["humidity"],
         "wind_speed": convert_wind_speed(api_result["wind_speed"], wind_unit),
+        "pressure": api_result["pressure"],
     }
 
     return api_result["city"], weather, warnings
